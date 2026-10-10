@@ -1,11 +1,13 @@
 """应用配置。
 
 所有配置项均可通过环境变量覆盖，环境变量优先级高于 `.env` 文件。
-`.env` 查找顺序：`backend/.env` → 仓库根 `.env`。
+`.env` 查找顺序：`backend/.env` → 仓库根 `.env` → 仓库上级目录 `.env`，
+后者优先级最高；把 API 密钥写在上级目录那个 `.env` 里，就不会随仓库泄露。
 """
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -15,14 +17,19 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = BACKEND_DIR.parent
+#: 密钥源：仓库同级之外的 `.env`，不进版本库
+SECRETS_ENV = REPO_ROOT.parent / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=(BACKEND_DIR / ".env", REPO_ROOT / ".env"),
+        env_file=(BACKEND_DIR / ".env", REPO_ROOT / ".env", SECRETS_ENV),
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
+        # 关掉默认的 JSON 强解：列表字段以逗号分隔书写（见下方 validator），
+        # 否则 `CORS_ORIGINS=a,b` 会在进入 validator 之前就被 json.loads 打回
+        enable_decoding=False,
     )
 
     # ---------- 应用 ----------
@@ -34,7 +41,7 @@ class Settings(BaseSettings):
 
     # ---------- 数据库 ----------
     database_url: str = (
-        "postgresql+asyncpg://contract_review:contract_review@localhost:5432/contract_review"
+        "postgresql+asyncpg://contract_review:contract_review@localhost:5433/contract_review"
     )
     db_echo: bool = False
     db_pool_size: int = 5
@@ -43,11 +50,13 @@ class Settings(BaseSettings):
     # ---------- LLM（OpenAI 兼容接口）----------
     #: auto = 有密钥走真实模型，无密钥退回 Mock
     llm_provider: Literal["auto", "openai_compatible", "mock"] = "auto"
-    llm_base_url: str = "https://api.openai.com/v1"
+    llm_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    #: 优先从 `SECRETS_ENV`（仓库上级目录 .env）读取，仓库内不要写真实密钥
     llm_api_key: str = ""
-    llm_model: str = "gpt-4o-mini"
+    llm_model: str = "glm-5.3-flash"
     llm_temperature: float = 0.0
-    llm_max_tokens: int = 4096
+    #: 思考型模型的推理 token 也计入预算，留足余量避免 JSON 被截断
+    llm_max_tokens: int = 8192
     llm_timeout_seconds: int = 120
     # 单次审查送入模型的最大字符数，超出按条款分批
     llm_max_chars_per_call: int = 12_000
@@ -99,9 +108,12 @@ class Settings(BaseSettings):
     @field_validator("cors_origins", "allowed_upload_suffixes", mode="before")
     @classmethod
     def _split_comma_separated(cls, value: object) -> object:
-        """允许在 `.env` 中用逗号分隔书写列表。"""
-        if isinstance(value, str) and not value.strip().startswith("["):
-            return [item.strip() for item in value.split(",") if item.strip()]
+        """允许在 `.env` 中用逗号分隔书写列表，同时兼容 JSON 数组写法。"""
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [item.strip() for item in text.split(",") if item.strip()]
         return value
 
     @property

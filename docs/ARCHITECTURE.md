@@ -29,16 +29,16 @@ knowledge_ingest_runs     采集/入库审计记录
 
 `red_line_rules` 每行是一条可执行规则，`app/services/rules/engine.py` 解释执行：
 
-| 字段 | 语义 |
-| --- | --- |
-| `metric_key` | 指标键（`max_annual_cost_rate`、`irr_annual_rate`、`monthly_fee_rate`…）或特征键（`final_interpretation` 等） |
-| `operator` | `gt/gte/lt/lte/eq/exists/missing` |
+| 字段               | 语义                                                                                                             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `metric_key`       | 指标键（`max_annual_cost_rate`、`irr_annual_rate`、`monthly_fee_rate`…）或特征键（`final_interpretation` 等）    |
+| `operator`         | `gt/gte/lt/lte/eq/exists/missing`                                                                                |
 | `threshold_source` | `static` / `lpr_four_multiple` / `regulatory_cost_ceiling` / `historical_hard_ceiling` / `nominal_rate_multiple` |
-| `hard_block` | 硬拦截：结论定性不可被模型推翻 |
-| `llm_fallback` | 指标缺失时是否把该规则作为重点检查项交给模型 |
-| `keyword_patterns` | 正则弱信号，命中置信度 0.75，默认需 LLM + 人工确认 |
-| `applies_to` | 适用合同种类，空表示全部 |
-| `basis_refs` | 引用依据线索（法规名 + 条号），入库前不视为已核验 |
+| `hard_block`       | 硬拦截：结论定性不可被模型推翻                                                                                   |
+| `llm_fallback`     | 指标缺失时是否把该规则作为重点检查项交给模型                                                                     |
+| `keyword_patterns` | 正则弱信号，命中置信度 0.75，默认需 LLM + 人工确认                                                               |
+| `applies_to`       | 适用合同种类，空表示全部                                                                                         |
+| `basis_refs`       | 引用依据线索（法规名 + 条号），入库前不视为已核验                                                                |
 
 三种判定结果，缺一不可：
 
@@ -65,11 +65,11 @@ knowledge_ingest_runs     采集/入库审计记录
 
 ## 4. 引用的三级可信度
 
-| 状态 | 含义 | 前端表现 | 路由后果 |
-| --- | --- | --- | --- |
-| 已核验 | 命中条文且已有权威原文导入 | 绿色标签 | 可自动通过（非高风险时） |
-| 占位登记 | 命中条目但原文未导入 | 橙色"待核验" | **强制转人工** |
-| 未收录 | 知识库查不到该条 | 红色"引用未核验" | **强制转人工**，几乎必然是模型编造 |
+| 状态     | 含义                       | 前端表现         | 路由后果                           |
+| -------- | -------------------------- | ---------------- | ---------------------------------- |
+| 已核验   | 命中条文且已有权威原文导入 | 绿色标签         | 可自动通过（非高风险时）           |
+| 占位登记 | 命中条目但原文未导入       | 橙色"待核验"     | **强制转人工**                     |
+| 未收录   | 知识库查不到该条           | 红色"引用未核验" | **强制转人工**，几乎必然是模型编造 |
 
 ## 5. 失败语义
 

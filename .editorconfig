@@ -15,6 +15,11 @@ max_line_length = 120
 [*.{yml,yaml}]
 indent_size = 2
 
+# Windows PowerShell 5.1 只把「UTF-8 + BOM」识别为 UTF-8，无 BOM 会按 GBK 解码
+# 中文注释/字符串，甚至吞掉引号导致脚本解析失败，因此 .ps1 必须带 BOM 保存
+[*.ps1]
+charset = utf-8-bom
+
 [Makefile]
 indent_style = tab
 

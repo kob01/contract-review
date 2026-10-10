@@ -1,86 +1,96 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
-import { apiErrorMessage } from '@/api/client'
-import { deleteContract, listContracts, reparseContract, startReview } from '@/api'
-import { Card, Empty, ErrorNote } from '@/components/badges'
+import { useCallback, useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import { apiErrorMessage } from "@/api/client";
+import {
+  deleteContract,
+  listContracts,
+  reparseContract,
+  startReview,
+} from "@/api";
+import { Card, Empty, ErrorNote } from "@/components/badges";
 import {
   contractKindLabels,
   contractStatusLabels,
   formatBytes,
   formatTime,
-} from '@/lib/labels'
-import type { ContractBrief } from '@/types'
+} from "@/lib/labels";
+import type { ContractBrief } from "@/types";
 
 const statusTone: Record<string, string> = {
-  reviewed: 'bg-emerald-100 text-emerald-700',
-  reviewed_pending: 'bg-emerald-100 text-emerald-700',
-  reviewing: 'bg-blue-100 text-blue-700',
-  parsed: 'bg-slate-100 text-slate-700',
-  failed: 'bg-red-100 text-red-700',
-  uploaded: 'bg-amber-100 text-amber-800',
-  parsing: 'bg-amber-100 text-amber-800',
-}
+  reviewed: "bg-emerald-100 text-emerald-700",
+  reviewed_pending: "bg-emerald-100 text-emerald-700",
+  reviewing: "bg-blue-100 text-blue-700",
+  parsed: "bg-slate-100 text-slate-700",
+  failed: "bg-red-100 text-red-700",
+  uploaded: "bg-amber-100 text-amber-800",
+  parsing: "bg-amber-100 text-amber-800",
+};
 
 export default function ContractListPage() {
-  const navigate = useNavigate()
-  const [items, setItems] = useState<ContractBrief[]>([])
-  const [error, setError] = useState<string | null>(null)
-  const [loading, setLoading] = useState(true)
-  const [busyId, setBusyId] = useState<string | null>(null)
+  const navigate = useNavigate();
+  const [items, setItems] = useState<ContractBrief[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    setLoading(true)
+    setLoading(true);
     try {
-      const data = await listContracts()
-      setItems(data.items)
-      setError(null)
+      const data = await listContracts();
+      setItems(data.items);
+      setError(null);
     } catch (err) {
-      setError(apiErrorMessage(err))
+      setError(apiErrorMessage(err));
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }, [])
+  }, []);
 
   useEffect(() => {
-    void refresh()
-  }, [refresh])
+    void refresh();
+  }, [refresh]);
 
   const runReview = async (contract: ContractBrief) => {
-    setBusyId(contract.id)
+    setBusyId(contract.id);
     try {
-      const review = await startReview(contract.id)
-      navigate(`/contracts/${contract.id}/reviews/${review.id}`)
+      const review = await startReview(contract.id);
+      navigate(`/contracts/${contract.id}/reviews/${review.id}`);
     } catch (err) {
-      setError(apiErrorMessage(err))
+      setError(apiErrorMessage(err));
     } finally {
-      setBusyId(null)
+      setBusyId(null);
     }
-  }
+  };
 
   const reparse = async (contract: ContractBrief) => {
-    setBusyId(contract.id)
+    setBusyId(contract.id);
     try {
-      await reparseContract(contract.id)
-      await refresh()
+      await reparseContract(contract.id);
+      await refresh();
     } catch (err) {
-      setError(apiErrorMessage(err))
+      setError(apiErrorMessage(err));
     } finally {
-      setBusyId(null)
+      setBusyId(null);
     }
-  }
+  };
 
   const remove = async (contract: ContractBrief) => {
-    if (!window.confirm(`确认删除《${contract.title}》及其审查记录？该操作不可恢复。`)) return
-    setBusyId(contract.id)
+    if (
+      !window.confirm(
+        `确认删除《${contract.title}》及其审查记录？该操作不可恢复。`,
+      )
+    )
+      return;
+    setBusyId(contract.id);
     try {
-      await deleteContract(contract.id)
-      await refresh()
+      await deleteContract(contract.id);
+      await refresh();
     } catch (err) {
-      setError(apiErrorMessage(err))
+      setError(apiErrorMessage(err));
     } finally {
-      setBusyId(null)
+      setBusyId(null);
     }
-  }
+  };
 
   return (
     <div className="space-y-4">
@@ -131,11 +141,17 @@ export default function ContractListPage() {
               </thead>
               <tbody>
                 {items.map((contract) => (
-                  <tr key={contract.id} className="border-b border-slate-100 hover:bg-slate-50/60">
+                  <tr
+                    key={contract.id}
+                    className="border-b border-slate-100 hover:bg-slate-50/60"
+                  >
                     <td className="py-2.5 pr-4">
-                      <div className="font-medium text-slate-900">{contract.title}</div>
+                      <div className="font-medium text-slate-900">
+                        {contract.title}
+                      </div>
                       <div className="text-xs text-slate-500">
-                        {contract.fileName} · {contract.lenderName ?? '未填写放款机构'}
+                        {contract.fileName} ·{" "}
+                        {contract.lenderName ?? "未填写放款机构"}
                       </div>
                     </td>
                     <td className="py-2.5 pr-4 text-xs text-slate-600">
@@ -143,21 +159,25 @@ export default function ContractListPage() {
                     </td>
                     <td className="py-2.5 pr-4">
                       <span
-                        className={`rounded-full px-2 py-0.5 text-xs ${statusTone[contract.status] ?? 'bg-slate-100 text-slate-600'}`}
+                        className={`rounded-full px-2 py-0.5 text-xs ${statusTone[contract.status] ?? "bg-slate-100 text-slate-600"}`}
                       >
                         {contractStatusLabels[contract.status]}
                       </span>
                     </td>
                     <td className="py-2.5 pr-4 text-xs text-slate-500">
-                      {contract.pageCount} 页 / {formatBytes(contract.fileSizeBytes)}
+                      {contract.pageCount} 页 /{" "}
+                      {formatBytes(contract.fileSizeBytes)}
                     </td>
                     <td className="py-2.5 pr-4">
-                      {contract.latestRiskScore === null || contract.latestRiskScore === undefined ? (
+                      {contract.latestRiskScore === null ||
+                      contract.latestRiskScore === undefined ? (
                         <span className="text-xs text-slate-400">未审查</span>
                       ) : (
                         <span className="font-semibold tabular-nums text-slate-800">
                           {contract.latestRiskScore}
-                          <span className="ml-1 text-xs font-normal text-slate-400">/100</span>
+                          <span className="ml-1 text-xs font-normal text-slate-400">
+                            /100
+                          </span>
                         </span>
                       )}
                     </td>
@@ -185,11 +205,14 @@ export default function ContractListPage() {
                         )}
                         <button
                           type="button"
-                          disabled={busyId === contract.id || contract.status === 'parsing'}
+                          disabled={
+                            busyId === contract.id ||
+                            contract.status === "parsing"
+                          }
                           onClick={() => void runReview(contract)}
                           className="rounded-lg bg-slate-900 px-2 py-1 text-white disabled:opacity-40"
                         >
-                          {contract.latestReviewId ? '重新审查' : '开始审查'}
+                          {contract.latestReviewId ? "重新审查" : "开始审查"}
                         </button>
                         <button
                           type="button"
@@ -218,9 +241,10 @@ export default function ContractListPage() {
       </Card>
 
       <p className="text-xs text-slate-400">
-        说明：风险评分由结论等级折算（高 18 / 中 8 / 低 2 分扣减），只用于横向比较，
+        说明：风险评分由结论等级折算（高 18 / 中 8 / 低 2
+        分扣减），只用于横向比较，
         不构成合规结论；结论本身以规则命中与已核验引用为准。
       </p>
     </div>
-  )
+  );
 }

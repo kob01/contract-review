@@ -12,13 +12,18 @@ services:
       POSTGRES_USER: contract_review
       POSTGRES_PASSWORD: contract_review
     ports:
-      # 5432 被本地已有实例占用时，设 DB_PORT=5433 并把 DATABASE_URL 的端口同步改掉
-      - "${DB_PORT:-5432}:5432"
+      # 只可改宿主机侧端口（容器内 Postgres 固定监听 5432）；默认 5433 是为了避开
+      # 本机其他项目已经占用的 5432，改完记得同步 .env 里 DATABASE_URL 的端口
+      - "${DB_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
       # 后端启动依赖 vector 扩展可用，因此探针直接验证扩展能否加载
-      test: ["CMD-SHELL", "pg_isready -U contract_review -d contract_review && psql -U contract_review -d contract_review -c 'CREATE EXTENSION IF NOT EXISTS vector;'"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U contract_review -d contract_review && psql -U contract_review -d contract_review -c 'CREATE EXTENSION IF NOT EXISTS vector;'",
+        ]
       interval: 5s
       timeout: 5s
       retries: 12
@@ -30,6 +35,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+      # API 密钥从仓库上级目录的 .env 取（与后端 dotenv 查找链一致）；文件缺失时不影响启动
+      - path: ../.env
+        required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
       # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8080

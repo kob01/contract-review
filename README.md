@@ -9,11 +9,22 @@
 
 ## 快速开始
 
+Windows（在 PowerShell 里执行，不是 bash/Git Bash）：
+
+```powershell
+Copy-Item .env.example .env     # 默认无需任何密钥即可跑通全链路（离线 Mock）
+.\scripts\dev.ps1               # 起 pgvector + 后端 + 前端
+```
+
+macOS / Linux / Git Bash：
+
 ```bash
 cp .env.example .env            # 默认无需任何密钥即可跑通全链路（离线 Mock）
-./scripts/dev.ps1               # Windows：起 pgvector + 后端 + 前端
-./scripts/dev.sh                # macOS / Linux
+./scripts/dev.sh                # 起 pgvector + 后端 + 前端
 ```
+
+> 两个脚本按脚本类型选执行器，不能互相代跑：在 bash 里跑 `./scripts/dev.ps1` 会被 sh 解析并报
+> `syntax error near unexpected token 'newline'`。仅起数据库用 `-DbOnly` / `--db-only`。
 
 拉起数据库与完整后端：
 
@@ -26,17 +37,19 @@ cd frontend && npm run dev
 访问 <http://localhost:5173>，上传 `samples/consumer-loan-demo.txt` 即可看到完整审查报告。
 
 > Docker Hub 不可直连时，在 `.env` 里设 `PGVECTOR_IMAGE=docker.m.daocloud.io/pgvector/pgvector:pg16`；
-> 本机 5432 被占用时设 `DB_PORT=5433` 并同步修改 `DATABASE_URL` 的端口。
+> 数据库默认映射宿主机 **5433**（容器内 Postgres 固定监听 5432，只能改宿主机侧端口）。
+> 改端口时下列四处必须一致，否则后端会连到旧端口：`docker-compose.yml` 的 `${DB_PORT:-5433}` 默认值、
+> `.env` 的 `DB_PORT`、`.env` 的 `DATABASE_URL`、`backend/app/core/config.py` 的 `database_url` 默认值。
 
 ## 技术栈
 
-| 层 | 选型 |
-| --- | --- |
-| 前端 | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮） |
-| 后端 | FastAPI + SQLAlchemy 2.0（async）+ **uv** |
-| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + pgvector 混合检索 |
-| 模型 | OpenAI 兼容接口（OpenAI / DeepSeek / 通义 / Kimi / vLLM / Ollama 均可切换） |
-| 数据 | PostgreSQL 16 + pgvector（法条、罚单、红线、结论、复核任务同源一库） |
+| 层    | 选型                                                                          |
+| ----- | ----------------------------------------------------------------------------- |
+| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮） |
+| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**                                     |
+| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + pgvector 混合检索    |
+| 模型  | OpenAI 兼容接口（OpenAI / DeepSeek / 通义 / Kimi / vLLM / Ollama 均可切换）   |
+| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、结论、复核任务同源一库）          |
 
 ## 双通道审查流程
 
@@ -110,18 +123,18 @@ samples/               consumer-loan-demo.txt 演示样本
 
 ## API 概览
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| POST | `/api/v1/contracts` | 上传并解析（抽取文本 + 指标） |
-| POST | `/api/v1/contracts/{id}/reviews` | 发起双通道审查（后台执行，返回 202） |
-| GET | `/api/v1/reviews/{id}/report` | 结论 + 溯源引用 + 参考条文 + 指标告警 |
-| GET | `/api/v1/human-review/queue` | 待复核队列 |
-| POST | `/api/v1/human-review/tasks/{id}/resolve` | 提交复核结论（回写并计入误报率） |
-| GET | `/api/v1/human-review/export/sft` | 导出标注样本 |
-| POST | `/api/v1/redlines/dry-run` | 规则试算（不调模型、不写记录） |
-| POST | `/api/v1/knowledge/provisions` | 导入权威条文原文 |
-| GET | `/api/v1/knowledge/search` | 混合检索自检（展示召回路径与是否 mock） |
-| GET | `/api/v1/health` | 连通性 + 降级程度（LLM/向量/规则库/法条库） |
+| 方法 | 路径                                      | 说明                                        |
+| ---- | ----------------------------------------- | ------------------------------------------- |
+| POST | `/api/v1/contracts`                       | 上传并解析（抽取文本 + 指标）               |
+| POST | `/api/v1/contracts/{id}/reviews`          | 发起双通道审查（后台执行，返回 202）        |
+| GET  | `/api/v1/reviews/{id}/report`             | 结论 + 溯源引用 + 参考条文 + 指标告警       |
+| GET  | `/api/v1/human-review/queue`              | 待复核队列                                  |
+| POST | `/api/v1/human-review/tasks/{id}/resolve` | 提交复核结论（回写并计入误报率）            |
+| GET  | `/api/v1/human-review/export/sft`         | 导出标注样本                                |
+| POST | `/api/v1/redlines/dry-run`                | 规则试算（不调模型、不写记录）              |
+| POST | `/api/v1/knowledge/provisions`            | 导入权威条文原文                            |
+| GET  | `/api/v1/knowledge/search`                | 混合检索自检（展示召回路径与是否 mock）     |
+| GET  | `/api/v1/health`                          | 连通性 + 降级程度（LLM/向量/规则库/法条库） |
 
 ## 测试
 
