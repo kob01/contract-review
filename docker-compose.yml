@@ -1,0 +1,58 @@
+name: contract-review
+
+services:
+  db:
+    # 无法直连 Docker Hub 的环境可把 PGVECTOR_IMAGE 指向镜像站，例如
+    # docker.m.daocloud.io/pgvector/pgvector:pg16
+    image: ${PGVECTOR_IMAGE:-pgvector/pgvector:pg16}
+    container_name: contract-review-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: contract_review
+      POSTGRES_USER: contract_review
+      POSTGRES_PASSWORD: contract_review
+    ports:
+      # 5432 被本地已有实例占用时，设 DB_PORT=5433 并把 DATABASE_URL 的端口同步改掉
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 后端启动依赖 vector 扩展可用，因此探针直接验证扩展能否加载
+      test: ["CMD-SHELL", "pg_isready -U contract_review -d contract_review && psql -U contract_review -d contract_review -c 'CREATE EXTENSION IF NOT EXISTS vector;'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build:
+      context: ./backend
+    container_name: contract-review-backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
+      # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8080
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      UPLOAD_DIR: /app/storage/contracts
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - contract-storage:/app/storage
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: contract-review-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  pgdata:
+  contract-storage:

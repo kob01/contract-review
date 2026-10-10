@@ -1,0 +1,31 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-risk-high: #dc2626;
+  --color-risk-medium: #f59e0b;
+  --color-risk-low: #2563eb;
+  --color-risk-none: #16a34a;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', Roboto,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--color-slate-50);
+  color: var(--color-slate-800);
+}
+
+/* 合同原文与审查意见中的长句不应撑破布局 */
+.prose-contract {
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.9;
+}

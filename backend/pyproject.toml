@@ -1,0 +1,74 @@
+[project]
+name = "contract-review-backend"
+version = "0.1.0"
+description = "AI 合同审查系统 · FastAPI 后端服务"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+
+dependencies = [
+    # Web 框架
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    # 配置与校验
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    # 数据库
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    "pgvector>=0.3.6",
+    # LLM（OpenAI 兼容接口：OpenAI / DeepSeek / 通义 / Kimi / vLLM / Ollama）
+    "openai>=1.55",
+    # RAG 节点与检索器抽象（向量相似度由 pgvector SQL 完成，便于引用直接回连法条主表）
+    "llama-index-core>=0.12,<0.13",
+    # 文档解析
+    "pypdf>=5.1",
+    "python-docx>=1.1.2",
+    # 监管公开信息采集
+    "httpx>=0.28",
+    "beautifulsoup4>=4.12",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "httpx>=0.28",
+    "ruff>=0.8",
+    "mypy>=1.13",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "C4", "UP", "SIM", "RUF"]
+ignore = [
+    "B008",   # FastAPI 依赖注入惯用写法
+    "RUF001", # 中文标点不是“易混淆字符”，注释与文档大量使用全角符号
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Pydantic 模型与 ORM 字段用 `= []` / `mapped_column(...)` 声明默认值是常规写法，
+# RUF012 要求加 ClassVar 反而会破坏语义
+"app/schemas/*.py" = ["RUF012"]
+"app/models/*.py" = ["RUF012"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = false
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

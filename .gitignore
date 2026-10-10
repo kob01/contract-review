@@ -1,0 +1,82 @@
+# ---------- Node / 前端 ----------
+node_modules/
+frontend/dist/
+frontend/build/
+.umi/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# ---------- Python / 后端 ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+backend/.venv/
+.venv/
+venv/
+env/
+uv.lock.bak
+.uv/
+*.egg-info/
+.eggs/
+build/lib/
+.installed.cfg
+
+# ---------- 测试 / 覆盖率 ----------
+coverage/
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nyc_output/
+*.cover
+cov.xml
+
+# ---------- 类型 / 构建产物 ----------
+tsconfig.tsbuildinfo
+frontend/dist-ssr/
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+
+# ---------- 上传的合同文件（含敏感商业信息，禁止入库）----------
+storage/
+backend/storage/
+uploads/
+*.docx
+*.doc
+*.pdf
+!docs/**/*.pdf
+
+# ---------- 数据库 ----------
+*.db
+*.sqlite3
+pgdata/
+pg_data/
+.DS_Store
+
+# ---------- IDE / 系统 ----------
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+
+# ---------- 日志 ----------
+logs/
+*.log
