@@ -43,7 +43,15 @@ class ContractReview(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     llm_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     embedding_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(32), default="v1", nullable=False)
+    #: 结论复核（LLM judge）所用模型；空串表示本次未执行复核
+    judge_model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    judge_call_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    #: 复核失败的批次数量：不能把“没复核成”隐呈现为“复核通过”
+    judge_failed_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    #: 本次实际参与召回的通道（exact_ref/vector/bm25/keyword/rerank）。
+    #: 降级必须可事后审计：不能把“ES 挂了只走了关键词”呈现成混合检索结果
+    retrieval_channels: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
     #: 审查立场与范围快照（JSON），便于复现同一次运行
     run_options: Mapped[dict] = mapped_column(JSONType, default=dict, nullable=False)
     #: 本次实际进入提示词的法条快照，报告页用作"参考依据"并支持事后审计
@@ -134,6 +142,10 @@ class ReviewFinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     citations: Mapped[list[dict]] = mapped_column(JSONType, default=list, nullable=False)
     similar_case_ids: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+
+    # ---------- 结论复核（LLM judge）----------
+    #: 复核裁定快照：{judged, agree, citationOk, suggestedRiskLevel, confidence, reason, judgedBy}
+    judge_verdict: Mapped[dict] = mapped_column(JSONType, default=dict, nullable=False)
 
     # ---------- 人工复核 ----------
     human_review_status: Mapped[str] = mapped_column(

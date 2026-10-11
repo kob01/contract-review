@@ -30,6 +30,12 @@ class HealthResponse(CamelModel):
     embedding_provider: str
     #: mock 向量时检索结果不具语义相关性，必须在响应里显式暴露
     embedding_is_mock: bool
+    #: 稀疏/重排通道的配置口径；ES 与 TEI 是否真连通以审查记录的
+    #: `retrievalChannels` 为准（那里是本次实际参与通道，不是配置值）
+    sparse_enabled: bool = False
+    rerank_enabled: bool = False
+    #: 空串表示本次未配置独立复核模型
+    judge_model: str = ""
     knowledge_provision_count: int = 0
     red_line_rule_count: int = 0
 

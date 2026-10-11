@@ -50,13 +50,34 @@ def _extract_json_object(content: str) -> dict[str, Any]:
 class OpenAICompatibleProvider:
     name = "openai_compatible"
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        timeout_seconds: int | None = None,
+        reasoning_effort: str | None = None,
+    ) -> None:
+        """默认读 `LLM_*` 配置；传入参数用于另一个模型槽位（如复核 judge）。"""
         self._settings = settings
-        self.model = settings.llm_model
+        self._temperature = settings.llm_temperature if temperature is None else temperature
+        self._max_tokens = settings.llm_max_tokens if max_tokens is None else max_tokens
+        self.model = settings.llm_model if model is None else model
+        # 思考深度开关只在显式非 default 时下发：部分供应商不认识这个字段，
+        # 无条件带上会让整个调用 400
+        self._extra_body = (
+            {"reasoning_effort": reasoning_effort}
+            if reasoning_effort and reasoning_effort != "default"
+            else None
+        )
         self._client = AsyncOpenAI(
-            base_url=settings.llm_base_url,
-            api_key=settings.llm_api_key or "not-needed",
-            timeout=settings.llm_timeout_seconds,
+            base_url=base_url or settings.llm_base_url,
+            api_key=(api_key if api_key is not None else settings.llm_api_key) or "not-needed",
+            timeout=timeout_seconds or settings.llm_timeout_seconds,
         )
 
     async def complete_json(self, *, system_prompt: str, user_prompt: str) -> LLMResult:
@@ -67,9 +88,10 @@ class OpenAICompatibleProvider:
             try:
                 completion = await self._client.chat.completions.create(
                     model=self.model,
-                    temperature=self._settings.llm_temperature,
-                    max_tokens=self._settings.llm_max_tokens,
+                    temperature=self._temperature,
+                    max_tokens=self._max_tokens,
                     response_format={"type": "json_object"},
+                    extra_body=self._extra_body,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
@@ -85,9 +107,27 @@ class OpenAICompatibleProvider:
                 last_error = exc
                 logger.warning("LLM 服务端错误（第 %s 次）：%s", attempt, exc.status_code)
             else:
-                content = (completion.choices[0].message.content or "").strip()
+                message = completion.choices[0].message
+                content = (message.content or "").strip()
                 if not content:
-                    raise LLMError("LLM 返回空内容")
+                    # 思考型模型最常见的失败不是报错而是“空回”：推理 token 把
+                    # max_tokens 预算占完，正文一个字都没输出。不能只写“返回空内容”，
+                    # 运维看不出是预算不够还是模型真的无话可说
+                    finish_reason = completion.choices[0].finish_reason
+                    reasoning = getattr(message, "reasoning_content", None) or ""
+                    usage = completion.usage
+                    reasoning_tokens = getattr(
+                        getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
+                    )
+                    if finish_reason == "length":
+                        raise LLMError(
+                            f"模型只输出思考内容就撞到 max_tokens 上限（思考 token={reasoning_tokens}，"
+                            f"reasoning {len(reasoning)} 字），正文为空："
+                            "请调大 LLM_MAX_TOKENS 或拆小 LLM_MAX_CHARS_PER_CALL"
+                        )
+                    raise LLMError(
+                        f"LLM 返回空内容（finish_reason={finish_reason}, reasoning {len(reasoning)} 字）"
+                    )
                 latency = time.perf_counter() - started
                 usage = completion.usage
                 return LLMResult(

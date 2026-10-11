@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -37,11 +38,92 @@ ON {table_name} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
 
 _VECTOR_TABLES = ("legal_provisions", "enforcement_cases")
 
+#: 开发期新增列的幂等补丁：`create_all` 不会给已存在的表加列，
+#: 而本项目还没接 Alembic，缺列会让写入在第一次审查时才报错。
+#: 类型跟 ORM 一致（Postgres 上 JSONType 实际是 jsonb）
+_ADDED_COLUMNS: dict[str, dict[str, str]] = {
+    "contract_reviews": {
+        "judge_model": "VARCHAR(128) NOT NULL DEFAULT ''",
+        "judge_call_count": "INTEGER NOT NULL DEFAULT 0",
+        "judge_failed_count": "INTEGER NOT NULL DEFAULT 0",
+        "retrieval_channels": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+    },
+    "review_findings": {
+        "judge_verdict": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+    },
+}
+
+
+async def ensure_added_columns() -> None:
+    """补齐已存在表的新列；列已存在时 `ADD COLUMN IF NOT EXISTS` 是空操作。"""
+    for table_name, columns in _ADDED_COLUMNS.items():
+        for column_name, column_ddl in columns.items():
+            sql = f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS "{column_name}" {column_ddl}'
+            async with engine.begin() as conn:
+                await conn.execute(text(sql))
+
+
+#: 读取向量列的实际类型，format_type 会返回形如 vector(1024)
+_VECTOR_COLUMN_TYPE_SQL = """
+SELECT format_type(a.atttypid, a.atttypmod) AS column_type
+FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = :table_name AND n.nspname = 'public' AND a.attname = 'embedding' AND a.attnum > 0
+"""
+
 
 async def ensure_vector_extension() -> None:
     """确保 vector 扩展存在，否则 jsonb 之外的向量列无法创建。"""
     async with engine.begin() as conn:
         await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+
+
+_VECTOR_DIMENSION_SQLS = (
+    'DROP INDEX IF EXISTS "{index}"',
+    'UPDATE "{table}" SET embedding = NULL WHERE embedding IS NOT NULL',
+    'ALTER TABLE "{table}" ALTER COLUMN embedding TYPE vector({dimensions})',
+)
+
+
+async def align_vector_dimensions() -> int:
+    """把向量列维度对齐到 `EMBEDDING_DIMENSIONS`，返回被改动的表数。
+
+    pgvector 的维度写在列定义里，换嵌入模型（1536 → 1024）不会被 `create_all`
+    自动修正，旧向量也不能直接转型。这里先清空向量（紧接着由启动时的
+    `rebuild_missing_embeddings` 重算），再删索引、改列类型。
+    """
+    expected = settings.embedding_dimensions
+    altered = 0
+
+    for table_name in _VECTOR_TABLES:
+        async with engine.connect() as conn:
+            current = (
+                await conn.execute(text(_VECTOR_COLUMN_TYPE_SQL), {"table_name": table_name})
+            ).scalar()
+        if current is None:
+            continue
+
+        match = re.search(r"vector\((\d+)\)", str(current))
+        if match and int(match.group(1)) == expected:
+            continue
+
+        logger.warning(
+            "向量列 %s.embedding 当前为 %s，重建为 vector(%s)；旧向量已清空，等待重算",
+            table_name,
+            current,
+            expected,
+        )
+        statements = (
+            sql.format(index=f"ix_{table_name}_embedding", table=table_name, dimensions=expected)
+            for sql in _VECTOR_DIMENSION_SQLS
+        )
+        async with engine.begin() as conn:
+            for sql in statements:
+                await conn.execute(text(sql))
+        altered += 1
+
+    return altered
 
 
 async def ensure_vector_indexes() -> None:
@@ -97,6 +179,8 @@ async def init_models() -> None:
     await ensure_vector_extension()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await ensure_added_columns()
+    await align_vector_dimensions()
     await ensure_vector_indexes()
 
 

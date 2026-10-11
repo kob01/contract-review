@@ -17,6 +17,7 @@ from app.models.knowledge import LegalProvision
 from app.models.redline import RedLineRule
 from app.schemas.common import HealthResponse
 from app.services.llm.factory import build_provider
+from app.services.rag.embeddings import describe_embedding_backend
 
 router = APIRouter(tags=["health"])
 
@@ -35,7 +36,7 @@ async def health(
         select(func.count()).select_from(RedLineRule).where(RedLineRule.is_active)
     )
 
-    embedder_name = "mock_hashing" if app_settings.rag_use_mock_embedding else "openai_compatible"
+    embedder_name = describe_embedding_backend(app_settings)
     provider = build_provider(app_settings)
 
     degraded = (
@@ -44,6 +45,8 @@ async def health(
         or not provision_count
         or app_settings.llm_provider == "mock"
         or provider.name == "mock"
+        # 哈希占位向量不承载语义：用它得出的引用相似度不可信，不能报 ok
+        or app_settings.rag_use_mock_embedding
     )
 
     return HealthResponse(
@@ -56,6 +59,9 @@ async def health(
         llm_model=provider.model,
         embedding_provider=embedder_name,
         embedding_is_mock=embedder_name == "mock_hashing",
+        sparse_enabled=app_settings.rag_sparse_enabled,
+        rerank_enabled=app_settings.rag_rerank_enabled,
+        judge_model=app_settings.judge_model if app_settings.judge_enabled else "",
         knowledge_provision_count=int(provision_count or 0),
         red_line_rule_count=int(rule_count or 0),
     )

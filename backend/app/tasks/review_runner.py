@@ -16,8 +16,10 @@ from app.models.contract import Contract
 from app.models.enums import ContractStatus, ReviewStatus
 from app.models.review import ContractReview
 from app.schemas.review import ReviewRunRequest
-from app.services.llm.factory import build_provider
+from app.services.llm.factory import build_judge_provider, build_provider
 from app.services.rag.embeddings import EmbeddingNotConfigured, build_embedding_client
+from app.services.rag.rerank import shared_reranker
+from app.services.rag.sparse import shared_sparse_index
 from app.services.review_pipeline import ReviewPipeline
 
 logger = get_logger(__name__)
@@ -37,7 +39,15 @@ async def run_review_task(review_id: uuid.UUID, request: ReviewRunRequest) -> No
 
     try:
         async with session_scope() as session:
-            pipeline = ReviewPipeline(session, provider, embedder, settings)
+            pipeline = ReviewPipeline(
+                session,
+                provider,
+                embedder,
+                settings,
+                sparse=shared_sparse_index(settings),
+                reranker=shared_reranker(settings),
+                judge=build_judge_provider(settings),
+            )
             await pipeline.run(review_id, request)
     except Exception as exc:  # pragma: no cover - 取决于模型与数据库状态
         logger.exception("审查执行失败 review=%s：%s", review_id, exc)

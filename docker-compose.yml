@@ -40,8 +40,8 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
-      # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8080
-      CORS_ORIGINS: http://localhost:5173,http://localhost:8080
+      # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8081
+      CORS_ORIGINS: http://localhost:5173,http://localhost:8081
       UPLOAD_DIR: /app/storage/contracts
     depends_on:
       db:
@@ -59,7 +59,8 @@ services:
     depends_on:
       - backend
     ports:
-      - "8080:80"
+      # 宿主 8080 已被本机 TEI 重排服务占用，前端对外改走 8081
+      - "8081:80"
 
 volumes:
   pgdata:

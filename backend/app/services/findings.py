@@ -44,6 +44,8 @@ class CandidateFinding:
     located: bool = True
     human_review_status: str = HumanReviewStatus.NOT_REQUIRED.value
     human_review_reason: str | None = None
+    #: 复核裁定快照，由 `apply_judge_verdicts` 写入
+    judge_verdict: dict = field(default_factory=dict)
 
     @property
     def has_unverified_citation(self) -> bool:
@@ -165,6 +167,7 @@ _REASON_PRIORITY = (
     HumanReviewReason.RULE_LLM_CONFLICT,
     HumanReviewReason.UNVERIFIED_CITATION,
     HumanReviewReason.METRIC_MISSING,
+    HumanReviewReason.JUDGE_DISPUTED,
     HumanReviewReason.LOW_CONFIDENCE,
     HumanReviewReason.HIGH_RISK_MANDATORY,
 )
@@ -228,3 +231,58 @@ def apply_routing(
         buckets.setdefault(item.rule_code or "llm", []).append((item, reason))
 
     return buckets
+
+
+def apply_judge_verdicts(
+    items: list[CandidateFinding],
+    verdicts: dict[int, dict],
+    *,
+    judge_model: str,
+    min_confidence: float,
+) -> dict[str, int]:
+    """把复核裁定写回结论，必要时把结论拉进人工复核队列。
+
+    只加严不减严：复核说“不成立”或把握不足时转人工，但复核给的等级建议
+    **不直接改写 risk_level**——等级口径以规则引擎为准，第二模型的异议
+    只作为记录保留，避免复核模型自己的错把已定级的高风险改低。
+
+    返回统计：{judged, disputed, unjudged}。
+    """
+    judged = disputed = unjudged = 0
+
+    for index, item in enumerate(items):
+        verdict = verdicts.get(index)
+        if verdict is None:
+            # 没拿到裁定 = 这一批复核失败，不能当作“复核通过”
+            item.judge_verdict = {
+                "judged": False,
+                "judgedBy": judge_model,
+                "reason": "本批未得到复核裁定（模型调用失败或返回不含该条）",
+            }
+            unjudged += 1
+            continue
+
+        agree = bool(verdict.get("agree", True))
+        confidence = float(verdict.get("confidence", 0.0) or 0.0)
+        item.judge_verdict = {
+            "judged": True,
+            "judgedBy": judge_model,
+            "agree": agree,
+            "citationOk": bool(verdict.get("citation_ok", verdict.get("citationOk", True))),
+            "suggestedRiskLevel": verdict.get("suggested_risk_level") or verdict.get("suggestedRiskLevel"),
+            "confidence": round(confidence, 4),
+            "reason": str(verdict.get("reason") or "")[:500],
+        }
+        judged += 1
+
+        if agree and confidence >= min_confidence:
+            continue
+
+        disputed += 1
+        if item.human_review_status == HumanReviewStatus.PENDING.value:
+            # 已因更硬的原因进队，不覆盖原 reason
+            continue
+        item.human_review_status = HumanReviewStatus.PENDING.value
+        item.human_review_reason = HumanReviewReason.JUDGE_DISPUTED.value
+
+    return {"judged": judged, "disputed": disputed, "unjudged": unjudged}

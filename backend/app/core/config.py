@@ -55,26 +55,76 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_model: str = "glm-5.3-flash"
     llm_temperature: float = 0.0
-    #: 思考型模型的推理 token 也计入预算，留足余量避免 JSON 被截断
-    llm_max_tokens: int = 8192
-    llm_timeout_seconds: int = 120
+    #: 实测：完整审查提示词下思考要 1.2~1.9万 token，16384 会在只思考不输出时截断
+    llm_max_tokens: int = 32768
+    #: 完整输出要 2~5 分钟，120s 会反复 ReadTimeout
+    llm_timeout_seconds: int = 300
+    #: GLM-5.3-Flash 始终思考，只能用 `reasoning_effort` 调节深度（实测同提示词：
+    #: low → 思考 39 token/9 条结论；默认 → 思考 1.2万 token/12 条结论）
+    #: default = 不传该参数，沿用供应商默认（深度最高）
+    llm_reasoning_effort: Literal["default", "low", "high", "max"] = "default"
     # 单次审查送入模型的最大字符数，超出按条款分批
     llm_max_chars_per_call: int = 12_000
     # 并发调用模型的上限，避免打爆供应商限速
     llm_max_concurrency: int = 3
 
+    # ---------- 结论复核（LLM judge）----------
+    #: 与主审查模型分槽：当前两者都是 glm-5.3-flash，日后改 DeepSeek 只改本段几行
+    #: 主模型与复核模型来路不同才能互为独立信号，同一家同一个模型的结论文书要标明这一点
+    judge_enabled: bool = True
+    #: 留空则复用 LLM_BASE_URL / LLM_API_KEY
+    judge_base_url: str = ""
+    judge_api_key: str = ""
+    judge_model: str = "glm-5.3-flash"
+    judge_temperature: float = 0.0
+    judge_max_tokens: int = 16384
+    judge_timeout_seconds: int = 300
+    #: 复核只做“成立不成立”的二阶判定，可用较低思考深度换成本与延时
+    judge_reasoning_effort: Literal["default", "low", "high", "max"] = "low"
+    judge_max_concurrency: int = 2
+    #: 单次送复核的结论条数上限
+    judge_max_items_per_call: int = 12
+    #: 复核置信度低于该值、或复核判定不成立时，强制转人工
+    judge_min_confidence: float = 0.60
+
     # ---------- 向量化与检索（RAG）----------
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dimensions: int = 1536
-    embedding_base_url: str = ""
+    #: ollama = 本地 /api/embed；openai_compatible = 远端 /embeddings；auto = 看 base_url 推断
+    embedding_provider: Literal["auto", "openai_compatible", "ollama", "mock"] = "auto"
+    embedding_model: str = "bge-m3"
+    #: bge-m3 稠密向量是 1024 维，改这个值会触发建表阶段的列维对齐
+    embedding_dimensions: int = 1024
+    embedding_base_url: str = "http://localhost:11434"
     embedding_api_key: str = ""
     #: 无密钥时使用确定性哈希向量，保证离线可跑通链路（仅用于开发/测试）
     rag_use_mock_embedding: bool = True
     rag_top_k: int = 6
-    #: 相似度下限，低于此分数不进提示词，避免拿不相关法条让模型“硬套”
-    rag_min_similarity: float = 0.30
+    #: 相似度下限，低于此分数不进提示词，避免拿不相关法条让模型“硬套”。
+    #: bge-m3 中文无关句也能到 0.37、相关句实测 0.74，沿用 OpenAI 时代的 0.30 等于不设卡
+    rag_min_similarity: float = 0.50
     #: pgvector 索引类型：none | ivfflat | hnsw
     vector_index_type: str = "hnsw"
+
+    # ---------- 稀疏检索（BM25 / Elasticsearch）----------
+    #: 关闭或 ES 不可达时，检索退回“条文直连 + ILIKE 关键词 + 向量”，不阻塞审查
+    rag_sparse_enabled: bool = True
+    es_url: str = "http://localhost:9200"
+    es_index: str = "contract_provisions"
+    #: 进入 RRF 融合前的 BM25 候选数
+    rag_sparse_candidate_size: int = 30
+    #: 至少命中查询词的比例（ES minimum_should_match 语法）。中文条文短、共用词少，
+    #: 默认只要命中一个词就进候选，排序交给 RRF 与 rerank，避免整路召回被截空
+    rag_sparse_min_should_match: str = "1"
+
+    # ---------- 重排（TEI cross-encoder）----------
+    #: 关闭或 TEI 不可达时沿用 RRF 名次，不影响审查可用性
+    rag_rerank_enabled: bool = True
+    rag_rerank_url: str = "http://localhost:8080"
+    rag_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    #: 送进去打分的候选上限：cross-encoder 成本随候选数线性增长
+    rag_rerank_max_candidates: int = 24
+    rag_rerank_timeout_seconds: float = 30.0
+    #: 低于该分的候选直接剔除；阈值需按实测分数分布定，不能拍脑袋
+    rag_rerank_min_score: float = 0.30
 
     # ---------- 监管阈值（可配置，不写死在代码里）----------
     #: 一年期 LPR（小数，0.031 表示 3.1%），民间借贷司法保护上限 = 4 × 此值

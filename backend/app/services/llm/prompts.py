@@ -157,3 +157,83 @@ def describe_pending_rules(rules, metrics_text: str) -> list[str]:
         f"{rule.code} {rule.name}：{rule.guidance_text} 建议：{rule.suggestion_text}"
         for rule in rules
     ]
+
+
+#: 复核提示词版本，与主审查提示词分开计量，便于对比“改词后误报率是否变化”
+JUDGE_PROMPT_VERSION = "judge-v1"
+
+_JUDGE_SYSTEM_TEMPLATE = """你是独立复核律师（第二意见模型）。你的职责是质疑已给出的合规结论，而不是附和它。
+审查结论已经过了规则引擎与引用核验，你只需要回答：“这条结论站不站得住”。
+
+# 可引用的法规条文清单（与主审查看到的是同一份）
+<<PROVISIONS>>
+
+# 判定口径
+- agree：该结论是否成立（条款确实存在所述问题，且定性正确）
+- citationOk：所引条文能否支撑结论（引用不支撑 = false，即使结论方向对）
+- suggestedRiskLevel：你认为应有的风险等级，与原判定一致时也要回填
+- confidence：你对本次裁定的把握度（0~1）
+
+# 硬性约束
+1. 原文片段与结论不搭、把程序/管辖条款说成实体违规、结论靠猜测补充事实 → agree=false。
+2. 不得因为分析写得长、语气确定就默认成立；也不得因为等级偏保守就判不成立。
+3. 拿不准时给低 confidence 让它转人工，不要附和可疑结论——漏放比误报严重。
+4. 每条都要给 verdicts 条目，index 必须原样回填。
+5. riskLevel 只能取：<<VALID_RISK>>。
+6. 严格只输出一个 JSON 对象，不要解释文字，不要 Markdown 代码块。
+
+# 输出结构（字段名必须完全一致）
+{
+  "verdicts": [
+    {
+      "index": 0,
+      "agree": true,
+      "citationOk": true,
+      "suggestedRiskLevel": "high",
+      "confidence": 0.8,
+      "reason": "不超过 40 字的判定理由"
+    }
+  ]
+}
+"""
+
+
+def build_judge_system_prompt(provisions: list[RetrievedProvision]) -> str:
+    rendered = (
+        "\n".join(
+            f"- [#{item.provision_id}] 《{item.law_name}》{item.article_no}"
+            f"{'（仅为占位登记，原文未导入）' if item.is_sample else ''}：{item.content}"
+            for item in provisions
+        )
+        or "（本轮没有可用条文，凡给出条文依据的结论都应判 citationOk=false）"
+    )
+    return _JUDGE_SYSTEM_TEMPLATE.replace("<<PROVISIONS>>", rendered).replace(
+        "<<VALID_RISK>>", _VALID_RISK
+    )
+
+
+def build_judge_user_prompt(cases: list[dict], *, batch_no: int, batch_total: int) -> str:
+    """`cases` 至少含 index/title/excerpt/analysis/riskLevel/source/confidence/citations。"""
+    lines = [
+        f"以下是待复核的合规结论（第 {batch_no}/{batch_total} 批），逐条给出裁定 JSON。",
+        "",
+    ]
+    for case in cases:
+        header = (
+            f"[结论 {case['index']}] {case.get('title') or ''}"
+            f"（等级 {case.get('riskLevel')}，来源 {case.get('source')}）"
+        )
+        lines.append(header)
+        lines.append(f"原文片段：{(case.get('excerpt') or '').strip()}")
+        lines.append(f"分析：{(case.get('analysis') or '').strip()}")
+        lines.append(f"建议：{(case.get('suggestion') or '').strip()}")
+        citations = case.get("citations") or []
+        if citations:
+            rendered = "; ".join(
+                f"《{item.get('lawName') or ''}》{item.get('articleNo') or ''}"
+                f"{'[未核验]' if not item.get('verified') else ''}"
+                for item in citations
+            )
+            lines.append(f"引用：{rendered}")
+        lines.append("")
+    return "\n".join(lines)

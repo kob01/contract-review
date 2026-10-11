@@ -40,7 +40,13 @@ from app.models.redline import RedLineRule
 from app.models.review import ContractReview, ReviewFinding
 from app.schemas.review import ReviewBatchDraft, ReviewFindingDraft, ReviewRunRequest
 from app.services.citation import resolve_citations
-from app.services.findings import CandidateFinding, apply_routing, merge_and_cross_check
+from app.services.findings import (
+    CandidateFinding,
+    apply_judge_verdicts,
+    apply_routing,
+    merge_and_cross_check,
+)
+from app.services.judge import run_judge
 from app.services.llm.base import LLMError, LLMProvider
 from app.services.llm.prompts import (
     PROMPT_VERSION,
@@ -51,7 +57,9 @@ from app.services.llm.prompts import (
 )
 from app.services.parser.segmenter import batch_segments, locate_excerpt
 from app.services.rag.embeddings import EmbeddingClient
+from app.services.rag.rerank import RerankClient
 from app.services.rag.retriever import ProvisionRetriever, RetrievedProvision
+from app.services.rag.sparse import SparseSearchIndex
 from app.services.rules.engine import RuleEngine, RuleHit
 from app.services.rules.metrics import MetricSet, metric_summary_for_prompt
 from app.services.rules.seed import load_active_rules, rules_for_prompt
@@ -73,11 +81,18 @@ class ReviewPipeline:
         provider: LLMProvider,
         embedder: EmbeddingClient,
         app_settings: Settings,
+        *,
+        sparse: SparseSearchIndex | None = None,
+        reranker: RerankClient | None = None,
+        judge: LLMProvider | None = None,
     ) -> None:
         self._session = session
         self._provider = provider
         self._embedder = embedder
         self._settings = app_settings
+        self._sparse = sparse
+        self._reranker = reranker
+        self._judge = judge
 
     # ---------- 对外入口 ----------
 
@@ -119,6 +134,8 @@ class ReviewPipeline:
         review.status = ReviewStatus.RUNNING.value
         review.llm_model = self._provider.model
         review.embedding_model = f"{self._embedder.name}:{self._embedder.dimensions}"
+        #: 空串是有意保留的事实：本次没有独立复核模型
+        review.judge_model = self._judge.model if self._judge is not None else ""
         review.prompt_version = PROMPT_VERSION
         review.run_options = request.model_dump(mode="json", by_alias=True)
         review.started_at = datetime.now(UTC)
@@ -186,14 +203,27 @@ class ReviewPipeline:
             mandatory_high_risk=self._settings.mandatory_human_review_for_high_risk,
         )
 
+        # 复核在路由之后跑：它只能加严（把该人工的拉进队列），不能减严
+        judge_outcome = await run_judge(self._judge, merged, stats["retrieved"], self._settings)
+        judge_counts = apply_judge_verdicts(
+            merged,
+            judge_outcome.verdicts,
+            judge_model=judge_outcome.model,
+            min_confidence=self._settings.judge_min_confidence,
+        )
+
         return {
             "items": merged,
             "conflicts": conflicts,
             "rule_hits": len(evaluation.hits),
             "hard_hits": len(evaluation.hard_hits),
             "retrieved": stats["retrieved"],
+            "channels": stats["channels"],
             "llm_calls": stats["calls"],
             "failed_batches": stats["failed"],
+            "judge_calls": judge_outcome.calls,
+            "judge_failed": judge_outcome.failed_batches,
+            "judge_counts": judge_counts,
             "inconclusive": evaluation.inconclusive,
             "batch_total": stats["batches"],
         }
@@ -247,7 +277,7 @@ class ReviewPipeline:
         rule_items: list[CandidateFinding],
         focus_rules: list[RedLineRule],
     ) -> tuple[list[CandidateFinding], dict]:
-        stats = {"retrieved": [], "calls": 0, "failed": 0, "batches": 0}
+        stats = {"retrieved": [], "calls": 0, "failed": 0, "batches": 0, "channels": []}
         if request.rule_only:
             return [], stats
 
@@ -259,7 +289,13 @@ class ReviewPipeline:
 
         # 1) 逐批检索，累积去重后的条文池
         pool: dict[str, RetrievedProvision] = {}
-        retriever = ProvisionRetriever(self._session, self._embedder, self._settings)
+        retriever = ProvisionRetriever(
+            self._session,
+            self._embedder,
+            self._settings,
+            sparse=self._sparse,
+            reranker=self._reranker,
+        )
         basis_refs = [
             (str(ref.get("law_name")), ref.get("article_no"))
             for rule in focus_rules
@@ -272,6 +308,7 @@ class ReviewPipeline:
             for item in await retriever.search(query, refs=basis_refs, top_k=request.top_k):
                 pool.setdefault(item.provision_id, item)
 
+        stats["channels"] = retriever.channels_used
         stats["retrieved"] = list(pool.values())
 
         # 2) 并发调用模型（此阶段不碰数据库，AsyncSession 不是并发安全的）
@@ -394,6 +431,7 @@ class ReviewPipeline:
                 char_start=item.char_start,
                 char_end=item.char_end,
                 citations=item.citations,
+                judge_verdict=item.judge_verdict,
                 human_review_status=item.human_review_status,
                 order_index=index,
             )
@@ -439,6 +477,9 @@ class ReviewPipeline:
         ]
         review.llm_call_count = outcome["llm_calls"]
         review.failed_batch_count = outcome["failed_batches"]
+        review.judge_call_count = outcome["judge_calls"]
+        review.judge_failed_count = outcome["judge_failed"]
+        review.retrieval_channels = outcome["channels"]
         review.min_confidence = round(min((item.confidence for item in items), default=1.0), 4)
         review.pending_human_count = pending
         review.needs_human_review = pending > 0
@@ -504,6 +545,22 @@ def _build_summary(review: ContractReview, items: list[CandidateFinding], outcom
     ]
     if review.failed_batch_count:
         parts.append(f"有 {review.failed_batch_count} 个批次模型输出无效，已跳过。")
+
+    counts = outcome.get("judge_counts") or {}
+    if not review.judge_model:
+        parts.append("本次未执行独立结论复核（未配置复核模型），置信度路由仍按原口径生效。")
+    else:
+        judge_line = (
+            f"复核模型 {review.judge_model} 已复核 {counts.get('judged', 0)} 条，"
+            f"其中 {counts.get('disputed', 0)} 条被判为不成立或把握不足。"
+        )
+        if review.judge_failed_count:
+            judge_line += f" 另有 {review.judge_failed_count} 批复核调用失败，相关结论标记为未复核。"
+        parts.append(judge_line)
+
+    channels = outcome.get("channels") or []
+    if channels:
+        parts.append("本次召回参与通道：" + "、".join(channels) + "。")
     if placeholder:
         parts.append(
             f"存在 {placeholder} 处引用依据未核验（多为法条原文尚未导入），"

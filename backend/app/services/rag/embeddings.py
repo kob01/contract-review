@@ -1,8 +1,9 @@
 """向量化客户端。
 
-两种实现：
+三种实现：
+- `OllamaEmbeddings`：本地 Ollama 原生 `/api/embed`，默认对接 bge-m3（1024 维）；
 - `OpenAICompatEmbeddings`：走 OpenAI 兼容 `/embeddings` 接口，可对接
-  OpenAI、通义（text-embedding-v3）、BGE 服务、vLLM 等；
+  OpenAI、通义（text-embedding-v3）、vLLM 等；
 - `HashingEmbeddings`：确定性哈希向量，离线开发与单元测试专用。
 
 哈希向量不承载语义，用它跑出来的相似度检索结果**不可用于业务判断**，
@@ -25,6 +26,10 @@ class EmbeddingNotConfigured(RuntimeError):
     """需要真实语义向量但当前配置缺失。"""
 
 
+class EmbeddingDimensionMismatch(RuntimeError):
+    """模型返回的向量维度与 `EMBEDDING_DIMENSIONS` 不一致。"""
+
+
 class EmbeddingClient(Protocol):
     name: str
     dimensions: int
@@ -32,6 +37,67 @@ class EmbeddingClient(Protocol):
     async def embed_texts(self, texts: list[str]) -> list[list[float]]: ...
 
     async def embed_query(self, text: str) -> list[float]: ...
+
+
+def _check_dimensions(vectors: list[list[float]], expected: int, source: str) -> list[list[float]]:
+    """维度不一致时直接报错，不能让错维向量写进 pgvector 列。"""
+    for vector in vectors:
+        if len(vector) != expected:
+            raise EmbeddingDimensionMismatch(
+                f"{source} 返回 {len(vector)} 维向量，与 EMBEDDING_DIMENSIONS={expected} 不一致；"
+                "请对齐模型与维度（bge-m3=1024，text-embedding-3-small=1536）并重建向量列"
+            )
+    return vectors
+
+
+class OllamaEmbeddings:
+    """Ollama 原生批量接口，一次 `/api/embed` 可送多条文本。"""
+
+    name = "ollama"
+
+    def __init__(self, *, base_url: str, model: str, dimensions: int) -> None:
+        import httpx
+
+        self.model = model
+        self.dimensions = dimensions
+        self._base = _normalize_ollama_base(base_url)
+        self._client = httpx.AsyncClient(base_url=self._base, timeout=120)
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        vectors: list[list[float]] = []
+        batch = 32
+        for start in range(0, len(texts), batch):
+            chunk = texts[start : start + batch]
+            response = await self._client.post(
+                "/api/embed",
+                json={"model": self.model, "input": chunk, "truncate": True},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            embeddings = payload.get("embeddings")
+            if not isinstance(embeddings, list) or len(embeddings) != len(chunk):
+                raise EmbeddingDimensionMismatch(
+                    f"Ollama /api/embed 返回异常：期望 {len(chunk)} 条向量，实际 {embeddings!r:.200}"
+                )
+            vectors.extend([float(value) for value in item] for item in embeddings)
+        return _check_dimensions(vectors, self.dimensions, f"ollama:{self.model}")
+
+    async def embed_query(self, text: str) -> list[float]:
+        (vector,) = await self.embed_texts([text])
+        return vector
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
+def _normalize_ollama_base(base_url: str) -> str:
+    """兼容用户把 OpenAI 兼容地址（.../v1）填进 EMBEDDING_BASE_URL 的写法。"""
+    cleaned = (base_url or "").rstrip("/")
+    if cleaned.endswith("/v1"):
+        return cleaned[: -len("/v1")]
+    return cleaned
 
 
 class OpenAICompatEmbeddings:
@@ -56,7 +122,7 @@ class OpenAICompatEmbeddings:
                 model=self.model, input=chunk, dimensions=self.dimensions
             )
             vectors.extend(item.embedding for item in response.data)
-        return vectors
+        return _check_dimensions(vectors, self.dimensions, f"openai_compatible:{self.model}")
 
     async def embed_query(self, text: str) -> list[float]:
         (vector,) = await self.embed_texts([text])
@@ -111,27 +177,58 @@ class HashingEmbeddings:
         return tokens + bigrams
 
 
+def _looks_like_ollama(base_url: str) -> bool:
+    lowered = (base_url or "").lower()
+    return ":11434" in lowered or "ollama" in lowered
+
+
+def describe_embedding_backend(settings: Settings) -> str:
+    """不建连接地描述将用到的向量后端，供健康检查与统计接口复用。
+
+    健康检查不能为了取一个名字就新建 httpx/OpenAI 客户端，
+    否则每次探测都会多一个需要关闭的连接。
+    """
+    if settings.rag_use_mock_embedding or settings.embedding_provider == "mock":
+        return HashingEmbeddings.name
+
+    provider = settings.embedding_provider
+    if provider == "auto":
+        base_url = settings.embedding_base_url or settings.llm_base_url
+        provider = "ollama" if _looks_like_ollama(base_url) else "openai_compatible"
+    return provider
+
+
 def build_embedding_client(settings: Settings) -> EmbeddingClient:
     """按配置选择向量实现。"""
-    api_key = settings.embedding_api_key or settings.llm_api_key
-    base_url = settings.embedding_base_url or settings.llm_base_url
+    if settings.rag_use_mock_embedding or settings.embedding_provider == "mock":
+        logger.warning(
+            "当前使用哈希 mock 向量（%s 维），检索结果不具备语义相关性，仅用于链路验证",
+            settings.embedding_dimensions,
+        )
+        return HashingEmbeddings(dimensions=settings.embedding_dimensions)
 
-    if api_key and not settings.rag_use_mock_embedding:
-        return OpenAICompatEmbeddings(
+    base_url = settings.embedding_base_url or settings.llm_base_url
+    api_key = settings.embedding_api_key or settings.llm_api_key
+    provider = settings.embedding_provider
+    if provider == "auto":
+        provider = "ollama" if _looks_like_ollama(base_url) else "openai_compatible"
+
+    if provider == "ollama":
+        return OllamaEmbeddings(
             base_url=base_url,
-            api_key=api_key,
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
         )
 
-    if not settings.rag_use_mock_embedding:
+    if not api_key:
         raise EmbeddingNotConfigured(
             "未配置 embedding_api_key/llm_api_key，且已关闭 mock 向量；"
-            "请补密钥或把 RAG_USE_MOCK_EMBEDDING 设为 true"
+            "请补密钥、把 EMBEDDING_PROVIDER 指向本地 ollama，或把 RAG_USE_MOCK_EMBEDDING 设为 true"
         )
 
-    logger.warning(
-        "当前使用哈希 mock 向量（%s 维），检索结果不具备语义相关性，仅用于链路验证",
-        settings.embedding_dimensions,
+    return OpenAICompatEmbeddings(
+        base_url=base_url,
+        api_key=api_key,
+        model=settings.embedding_model,
+        dimensions=settings.embedding_dimensions,
     )
-    return HashingEmbeddings(dimensions=settings.embedding_dimensions)

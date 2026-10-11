@@ -78,6 +78,27 @@ class ReviewBatchDraft(CamelModel):
     findings: list[ReviewFindingDraft] = []
 
 
+class JudgeVerdictDraft(CamelModel):
+    """复核（judge）模型对某一条结论的裁定。
+
+    `index` 是送审列表里的序号，不是数据库主键：用序号回连才能把
+    “哪条结论被质疑”对上号，避免模型自己编 id。
+    """
+
+    index: int
+    agree: bool = True
+    citation_ok: bool = True
+    suggested_risk_level: RiskLevel | None = None
+    confidence: float = 0.5
+    reason: str = ""
+
+
+class JudgeBatchDraft(CamelModel):
+    """一轮复核调用的输出。"""
+
+    verdicts: list[JudgeVerdictDraft] = []
+
+
 # ---------- 出站 ----------
 
 
@@ -122,6 +143,9 @@ class FindingOut(CamelModel):
     citations: list[dict] = []
     has_unverified_citation: bool = False
 
+    #: 复核裁定（{judged, agree, citationOk, suggestedRiskLevel, confidence, reason, judgedBy}）
+    judge_verdict: dict = {}
+
     human_review_status: HumanReviewStatus
     human_reviewer_id: str | None = None
     human_comment: str | None = None
@@ -136,6 +160,12 @@ class ReviewSummary(CamelModel):
     llm_model: str
     embedding_model: str
     prompt_version: str
+    #: 复核模型；空串表示本次未执行结论复核
+    judge_model: str = ""
+    judge_call_count: int = 0
+    judge_failed_count: int = 0
+    #: 实际参与召回的通道，降级时前端需要据此提示
+    retrieval_channels: list[str] = []
     risk_score: int
     summary: str
     high_risk_count: int

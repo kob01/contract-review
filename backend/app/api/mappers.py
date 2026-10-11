@@ -89,6 +89,7 @@ def to_finding_out(finding: ReviewFinding) -> FindingOut:
         char_end=finding.char_end,
         citations=finding.citations or [],
         has_unverified_citation=finding.has_unverified_citation,
+        judge_verdict=finding.judge_verdict or {},
         human_review_status=finding.human_review_status,
         human_reviewer_id=finding.human_reviewer_id,
         human_comment=finding.human_comment,

@@ -91,6 +91,16 @@ class CaseSearchResponse(CamelModel):
     embedding_is_mock: bool = False
 
 
+class ReindexResult(CamelModel):
+    """一次向量/BM25 重建的结果，降级情形必须明说而不是默返 0。"""
+
+    embeddings_rebuilt: int = 0
+    sparse_synced: int = 0
+    sparse_enabled: bool = False
+    sparse_available: bool = False
+    message: str = ""
+
+
 class IngestRunRequest(CamelModel):
     """触发监管公开信息采集。
 

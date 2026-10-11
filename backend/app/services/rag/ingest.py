@@ -22,6 +22,7 @@ from app.core.logging import get_logger
 from app.models.enums import KnowledgeDocType
 from app.models.knowledge import EnforcementCase, LegalProvision
 from app.services.rag.embeddings import EmbeddingClient
+from app.services.rag.sparse import SparseDoc, SparseSearchIndex
 from app.services.rules.builtin_redlines import BUILTIN_RED_LINES
 
 logger = get_logger(__name__)
@@ -228,6 +229,48 @@ async def rebuild_missing_embeddings(
 
 def _embedding_text_row(row: LegalProvision) -> str:
     return f"《{row.law_name}》{row.article_no} {row.title or ''}\n{row.content}"
+
+
+def to_sparse_doc(row: LegalProvision) -> SparseDoc:
+    return SparseDoc(
+        provision_id=str(row.id),
+        law_name=row.law_name,
+        article_no=row.article_no,
+        doc_type=row.doc_type,
+        content=row.content,
+        is_sample=row.is_sample,
+        is_active=row.is_active,
+    )
+
+
+async def index_provisions(
+    session: AsyncSession, index: SparseSearchIndex, provision_ids: list[str]
+) -> int:
+    """把指定条文写进 BM25 索引（导入/修改后增量同步）。"""
+    if not provision_ids:
+        return 0
+    import uuid as _uuid
+
+    rows = (
+        await session.execute(
+            select(LegalProvision).where(LegalProvision.id.in_([_uuid.UUID(i) for i in provision_ids]))
+        )
+    ).scalars().all()
+    return await index.upsert([to_sparse_doc(row) for row in rows])
+
+
+async def sync_sparse_index(session: AsyncSession, index: SparseSearchIndex, *, limit: int = 5000) -> int:
+    """全量重建 BM25 索引。
+
+    占位记录也进索引：它仍会被召回，但下游会按 `is_sample` 标成“原文待核验”
+    并强制转人工，比“进不了检索”更容易暴露缺数据的事实。
+    """
+    rows = (
+        await session.execute(select(LegalProvision).order_by(LegalProvision.id).limit(limit))
+    ).scalars().all()
+    count = await index.upsert([to_sparse_doc(row) for row in rows])
+    logger.info("BM25 索引重建完成：%s 条", count)
+    return count
 
 
 async def upsert_enforcement_case(

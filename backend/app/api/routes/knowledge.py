@@ -8,8 +8,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import Settings, get_db, get_settings
+from app.api.deps import Settings, build_retriever, get_db, get_settings
 from app.api.mappers import to_case_out, to_provision_out
+from app.core.logging import get_logger
 from app.models.enums import KnowledgeDocType
 from app.models.knowledge import EnforcementCase, KnowledgeIngestRun, LegalProvision
 from app.models.redline import RedLineRule
@@ -23,18 +24,23 @@ from app.schemas.knowledge import (
     ProvisionIn,
     ProvisionOut,
     ProvisionSearchResponse,
+    ReindexResult,
 )
 from app.services.ingestion.regulator import fetch_penalty_notices, source_available
-from app.services.rag.embeddings import EmbeddingClient, build_embedding_client
+from app.services.rag.embeddings import EmbeddingClient, build_embedding_client, describe_embedding_backend
 from app.services.rag.ingest import (
     PLACEHOLDER_PREFIX,
     ProvisionInput,
+    index_provisions,
+    rebuild_missing_embeddings,
+    sync_sparse_index,
     upsert_enforcement_case,
     upsert_provision,
 )
-from app.services.rag.retriever import ProvisionRetriever
+from app.services.rag.sparse import shared_sparse_index
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
+logger = get_logger(__name__)
 
 
 def _embedder(app_settings: Settings) -> EmbeddingClient:
@@ -86,10 +92,8 @@ async def import_provision(
     embedder = None
     try:
         embedder = _embedder(app_settings)
-    except Exception as exc:  # 向量不可用时仍允许导入原文，检索退回关键词通道
-        from app.core.logging import get_logger
-
-        get_logger(__name__).warning("向量客户端不可用，条文将暂不向量化：%s", exc)
+    except Exception as exc:  # 向量不可用时仍允许导入原文，检索退回其余通道
+        logger.warning("向量客户端不可用，条文将暂不向量化：%s", exc)
 
     row, _ = await upsert_provision(
         session,
@@ -109,16 +113,33 @@ async def import_provision(
         embedder=embedder,
     )
     await session.commit()
+
+    # 同步 BM25 索引：失败不回滚已落库的条文，但必须说出口，否则新条文只在向量命里
+    sparse = shared_sparse_index(app_settings)
+    if sparse is not None:
+        try:
+            await index_provisions(session, sparse, [str(row.id)])
+        except Exception as exc:
+            logger.warning("条文已入库但未同步到 BM25 索引（可调 POST /knowledge/reindex 补）：%s", exc)
+
     return to_provision_out(row)
 
 
 @router.delete("/provisions/{provision_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_provision(provision_id: uuid.UUID, session: AsyncSession = Depends(get_db)) -> None:
+async def delete_provision(
+    provision_id: uuid.UUID,
+    session: AsyncSession = Depends(get_db),
+    app_settings: Settings = Depends(get_settings),
+) -> None:
     row = await session.get(LegalProvision, provision_id)
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="条文不存在")
     await session.delete(row)
     await session.commit()
+
+    sparse = shared_sparse_index(app_settings)
+    if sparse is not None:
+        await sparse.delete(str(provision_id))
 
 
 @router.get("/search", response_model=ProvisionSearchResponse)
@@ -129,11 +150,11 @@ async def search_provisions(
     session: AsyncSession = Depends(get_db),
     app_settings: Settings = Depends(get_settings),
 ) -> ProvisionSearchResponse:
-    """混合检索自检接口：三种召回路径分别是什么、命中了什么都可观察。"""
-    retriever = ProvisionRetriever(session, _embedder(app_settings), app_settings)
+    """混合检索自检接口：各召回通道是什么、命中了什么都可观察。"""
+    retriever = build_retriever(session, _embedder(app_settings), app_settings)
     items = await retriever.search(q, top_k=top_k, only_active=not include_inactive)
 
-    match_kinds: list[str] = []
+    match_kinds: list[str] = list(retriever.channels_used)
     for item in items:
         for kind in item.match_kinds:
             if kind not in match_kinds:
@@ -163,6 +184,45 @@ async def search_provisions(
         embedding_provider=app_settings.embedding_model,
         embedding_is_mock=app_settings.rag_use_mock_embedding,
         meta=PageMeta(total=len(items), page=1, page_size=len(items) or 1),
+    )
+
+
+@router.post("/reindex", response_model=ReindexResult)
+async def reindex_knowledge(
+    session: AsyncSession = Depends(get_db),
+    app_settings: Settings = Depends(get_settings),
+) -> ReindexResult:
+    """重建检索侧数据：补算缺失向量 + 全量同步 BM25 索引。
+
+    换嵌入模型、调整分词口径、ES 索引被清过之后都该调一次。向量与索引
+    分开返回，通道不可用时写进 message，而不是伪装成“重建成功”。
+    """
+    notes: list[str] = []
+
+    embeddings_rebuilt = 0
+    try:
+        embeddings_rebuilt = await rebuild_missing_embeddings(session, _embedder(app_settings))
+    except Exception as exc:
+        notes.append(f"向量重建未完成：{exc}")
+
+    sparse = shared_sparse_index(app_settings)
+    sparse_synced = 0
+    sparse_available = False
+    if sparse is None:
+        notes.append("BM25 通道已由 RAG_SPARSE_ENABLED 关闭")
+    else:
+        try:
+            sparse_synced = await sync_sparse_index(session, sparse)
+            sparse_available = True
+        except Exception as exc:
+            notes.append(f"BM25 索引未同步：{exc}")
+
+    return ReindexResult(
+        embeddings_rebuilt=embeddings_rebuilt,
+        sparse_synced=sparse_synced,
+        sparse_enabled=app_settings.rag_sparse_enabled,
+        sparse_available=sparse_available,
+        message="; ".join(notes),
     )
 
 
@@ -240,7 +300,9 @@ async def knowledge_stats(
         case_total=int(case_total or 0),
         rule_total=int(rule_total or 0),
         rule_active=int(rule_active or 0),
-        embedding_provider="mock_hashing" if app_settings.rag_use_mock_embedding else app_settings.embedding_model,
+        embedding_provider=(
+            "mock_hashing" if app_settings.rag_use_mock_embedding else describe_embedding_backend(app_settings)
+        ),
         embedding_is_mock=app_settings.rag_use_mock_embedding,
     )
 

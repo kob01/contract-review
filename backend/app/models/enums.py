@@ -86,6 +86,7 @@ class HumanReviewReason(StrEnum):
 
     LOW_CONFIDENCE = "low_confidence"          # 置信度未达阈值
     RULE_LLM_CONFLICT = "rule_llm_conflict"    # 双通道结论冲突
+    JUDGE_DISPUTED = "judge_disputed"          # 复核模型认为结论不成立或置信度不足
     HIGH_RISK_MANDATORY = "high_risk_mandatory"  # 高风险强制人工确认
     UNVERIFIED_CITATION = "unverified_citation"  # 引用的法条在库中找不到
     METRIC_MISSING = "metric_missing"          # 关键数值无法抽取，需人工核对

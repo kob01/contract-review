@@ -47,8 +47,9 @@ cd frontend && npm run dev
 | ----- | ----------------------------------------------------------------------------- |
 | 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮） |
 | 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**                                     |
-| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + pgvector 混合检索    |
-| 模型  | OpenAI 兼容接口（OpenAI / DeepSeek / 通义 / Kimi / vLLM / Ollama 均可切换）   |
+| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合 |
+| 检索  | **pgvector**（Ollama bge-m3，1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排 |
+| 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 |
 | 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、结论、复核任务同源一库）          |
 
 ## 双通道审查流程
@@ -59,11 +60,13 @@ cd frontend && npm run dev
   → 条款切分（segment + char range）
   → 确定性指标抽取（日/月/年化利率、综合成本、IRR、本金预扣比例、霸王条款特征）
   → 规则引擎判定硬红线（>24%、>4×LPR、砍头息、最终解释权、放弃抗辩…）
-  → RAG 检索法条（条文直连 + 关键词 + pgvector 余弦，三路融合）
+  → RAG 检索法条（条文直连 + pgvector 向量 + ES/jieba BM25 + ILIKE 兜底，四路 RRF 融合）
+  → cross-encoder 重排（bge-reranker-v2-m3，低相关候选剔除）
   → LLM 定性判断（只允许引用检索清单内的条文，数值不允许自己算）
   → 交叉校验（冲突以规则引擎为准，冲突计数入指标）
   → 引用核验（回库比对条文；占位/查不到 = 引用未核验）
-  → 置信度路由（<0.8 或引用未核验或高风险 → 人工复核队列）
+  → 结论复核（独立 judge 模型，只加严不减严）
+  → 置信度路由（<0.8 或引用未核验或高风险或复核质疑 → 人工复核队列）
   → 报告 + PDF 高亮 + 批注建议
 ```
 
@@ -94,10 +97,15 @@ LPR 每月变动时不改规则数据，只改一个参数；报告页展示当�
 
 ## 离线模式与可信度边界
 
-未配置密钥时：LLM 走启发式 Mock、向量走确定性哈希 Mock。
-**链路是通的，但检索相似度不具备语义含义**，健康检查、界面顶栏与报告都会显式标注这一点。
-用于真实审查前必须：配置 `LLM_API_KEY` / `EMBEDDING_API_KEY`、把 `RAG_USE_MOCK_EMBEDDING=false`、
-并导入权威条文原文。
+未配置密钥与本地服务时：LLM 走启发式 Mock、向量走确定性哈希 Mock、ES/TEI 不可达则少一路召回。
+**链路是通的，但检索相似度不具备语义含义**，健康检查、界面顶栏与报告都会显式标注这一点
+（`RAG_USE_MOCK_EMBEDDING=true` 时 `/health` 直接返回 `degraded`）。
+真实跑审查需要：`LLM_API_KEY`、本地 Ollama（bge-m3）或远端 embedding、Elasticsearch、TEI 重排服务，
+并把 `RAG_USE_MOCK_EMBEDDING=false` 与**导入权威条文原文**（否则检索只命中占位登记，全部结论进人工队列）。
+
+> 思考型模型（如 GLM-5.3-Flash）的推理 token 计入 `max_tokens`：实测单批审查思考要 1.2~1.9 万 token，
+> 预算给小会表现为"只思考不输出"的空回；`LLM_MAX_TOKENS` 默认 32768，
+> 可用 `LLM_REASONING_EFFORT=low` 换几十秒延时与数倍成本差距（代价是结论会漏）。
 
 ## 目录结构
 

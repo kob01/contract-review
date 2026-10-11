@@ -28,6 +28,8 @@ dependencies = [
     # 监管公开信息采集
     "httpx>=0.28",
     "beautifulsoup4>=4.12",
+    "elasticsearch>=8.15,<9",
+    "jieba>=0.42",
 ]
 
 [dependency-groups]
