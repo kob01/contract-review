@@ -25,7 +25,8 @@ export default function ThresholdEditor({
   // 草稿与当前值相同时不算改动：避开“拉新数据后要用 effect 重置草稿”那层绕路
   const changed = items.filter(
     (item) =>
-      drafts[item.key] !== undefined && drafts[item.key] !== formatEditable(item),
+      drafts[item.key] !== undefined &&
+      drafts[item.key] !== formatEditable(item),
   );
 
   const commit = async () => {
@@ -69,9 +70,14 @@ export default function ThresholdEditor({
           const raw = drafts[item.key] ?? "";
           return (
             <li key={item.key} className="flex flex-wrap items-center gap-2">
-              <label className="w-44 text-xs text-slate-700" title={item.description}>
+              <label
+                className="w-44 text-xs text-slate-700"
+                title={item.description}
+              >
                 {item.label}
-                <span className="ml-1 text-[11px] text-slate-400">{item.key}</span>
+                <span className="ml-1 text-[11px] text-slate-400">
+                  {item.key}
+                </span>
               </label>
               <input
                 value={raw === "" ? formatEditable(item) : raw}

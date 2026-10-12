@@ -49,14 +49,14 @@ cd frontend && npm run dev
 
 ## 技术栈
 
-| 层    | 选型                                                                                                           |
-| ----- | -------------------------------------------------------------------------------------------------------------- |
-| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                  |
-| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                     |
-| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                     |
-| 检索  | **pgvector**（Ollama bge-m3，1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排 |
+| 层    | 选型                                                                                                                  |
+| ----- | --------------------------------------------------------------------------------------------------------------------- |
+| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                         |
+| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                             |
+| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                            |
+| 检索  | **pgvector**（Ollama bge-m3，1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排        |
 | 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 + 回音壁防护 |
-| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、阈值口径、结论、复核任务同源一库）                                     |
+| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、阈值口径、结论、复核任务同源一库）                                        |
 
 ## 双通道审查流程
 
@@ -162,21 +162,21 @@ samples/               consumer-loan-demo.txt 演示样本
 
 ## API 概览
 
-| 方法 | 路径                                      | 说明                                        |
-| ---- | ----------------------------------------- | ------------------------------------------- |
-| POST | `/api/v1/contracts`                       | 上传并解析（抽取文本 + 指标）               |
+| 方法 | 路径                                      | 说明                                                                   |
+| ---- | ----------------------------------------- | ---------------------------------------------------------------------- |
+| POST | `/api/v1/contracts`                       | 上传并解析（抽取文本 + 指标）                                          |
 | POST | `/api/v1/contracts/{id}/reviews`          | 发起审查：写 pending 记录 + 入队，立即 202（已有在跑的则直接返回该轮） |
-| GET  | `/api/v1/reviews/{id}/status`             | 轮询专用轻响应（只回状态/时间戳/心跳）      |
-| GET  | `/api/v1/reviews/{id}/report`             | 结论 + 溯源引用 + 参考条文 + 参考罚单 + 指标告警 |
-| GET  | `/api/v1/human-review/queue`              | 待复核队列                                  |
-| POST | `/api/v1/human-review/tasks/{id}/resolve` | 提交复核结论（回写并计入误报率）            |
-| GET  | `/api/v1/human-review/export/sft`         | 导出标注样本                                |
-| GET  | `/api/v1/redlines/thresholds`             | 当前生效阈值口径（含来源/生效日/合法区间）  |
-| PUT  | `/api/v1/redlines/thresholds`             | 批量调整阈值口径（整批校验，越界拒收）      |
-| POST | `/api/v1/redlines/dry-run`                | 规则试算（不调模型、不写记录）              |
-| POST | `/api/v1/knowledge/provisions`            | 导入权威条文原文                            |
-| GET  | `/api/v1/knowledge/search`                | 混合检索自检（展示召回路径与是否 mock）     |
-| GET  | `/api/v1/health`                          | 连通性 + 降级程度（LLM/向量/队列/复核独立性/规则库/法条库） |
+| GET  | `/api/v1/reviews/{id}/status`             | 轮询专用轻响应（只回状态/时间戳/心跳）                                 |
+| GET  | `/api/v1/reviews/{id}/report`             | 结论 + 溯源引用 + 参考条文 + 参考罚单 + 指标告警                       |
+| GET  | `/api/v1/human-review/queue`              | 待复核队列                                                             |
+| POST | `/api/v1/human-review/tasks/{id}/resolve` | 提交复核结论（回写并计入误报率）                                       |
+| GET  | `/api/v1/human-review/export/sft`         | 导出标注样本                                                           |
+| GET  | `/api/v1/redlines/thresholds`             | 当前生效阈值口径（含来源/生效日/合法区间）                             |
+| PUT  | `/api/v1/redlines/thresholds`             | 批量调整阈值口径（整批校验，越界拒收）                                 |
+| POST | `/api/v1/redlines/dry-run`                | 规则试算（不调模型、不写记录）                                         |
+| POST | `/api/v1/knowledge/provisions`            | 导入权威条文原文                                                       |
+| GET  | `/api/v1/knowledge/search`                | 混合检索自检（展示召回路径与是否 mock）                                |
+| GET  | `/api/v1/health`                          | 连通性 + 降级程度（LLM/向量/队列/复核独立性/规则库/法条库）            |
 
 ## 测试
 

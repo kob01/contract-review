@@ -119,7 +119,8 @@ export default function AppShell() {
                 </span>
                 <span
                   className={
-                    health.queueState === "connected" && health.queueWorkerAlive !== false
+                    health.queueState === "connected" &&
+                    health.queueWorkerAlive !== false
                       ? "text-slate-500"
                       : "text-amber-700"
                   }
@@ -156,7 +157,8 @@ export default function AppShell() {
         {!!health && (health.configWarnings?.length ?? 0) > 0 && (
           <div className="bg-amber-50 px-6 py-2 text-xs text-amber-800">
             <div className="font-medium">
-              降级运行（{(health.configWarnings ?? []).length} 项配置口径不该上线）
+              降级运行（{(health.configWarnings ?? []).length}{" "}
+              项配置口径不该上线）
             </div>
             <ul className="mt-1 list-disc pl-5">
               {(health.configWarnings ?? []).map((warning) => (

@@ -188,7 +188,8 @@ export default function FindingCard({
 
       {(finding.similarCaseIds?.length ?? 0) > 0 && (
         <p className="mt-2 text-[11px] text-slate-500">
-          同类违规参考罚单 {finding.similarCaseIds?.length} 条（仅类比，不作法条依据）
+          同类违规参考罚单 {finding.similarCaseIds?.length}{" "}
+          条（仅类比，不作法条依据）
         </p>
       )}
 

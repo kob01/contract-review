@@ -33,9 +33,10 @@ export default function ReviewReportPage() {
     "all" | "rule" | "llm" | "both"
   >("all");
   // 排队/执行阶段只看状态：拉完整报告会把报告页自己变成负载源
-  const [live, setLive] = useState<{ status: string; heartbeatAt?: string | null } | null>(
-    null,
-  );
+  const [live, setLive] = useState<{
+    status: string;
+    heartbeatAt?: string | null;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -134,7 +135,9 @@ export default function ReviewReportPage() {
   const judgeModel = review.judgeModel || "";
   // 同一个模型给自己盖章只是附和：这一点必须写进文书，不能默默过掉
   const echoChamber =
-    judgeModel !== "" && judgeModel === review.llmModel && !judgeModel.startsWith("rule-check");
+    judgeModel !== "" &&
+    judgeModel === review.llmModel &&
+    !judgeModel.startsWith("rule-check");
 
   return (
     <div className="space-y-4">
@@ -169,7 +172,10 @@ export default function ReviewReportPage() {
                   : "本次未执行结论复核"
             }
           >
-            复核：{echoChamber ? `${judgeModel}（与主审同源）` : judgeModel || "未复核"}
+            复核：
+            {echoChamber
+              ? `${judgeModel}（与主审同源）`
+              : judgeModel || "未复核"}
           </span>
           <span className="rounded-lg bg-slate-100 px-2 py-1 text-slate-600">
             耗时 {review.elapsedSeconds.toFixed(1)}s
@@ -187,14 +193,16 @@ export default function ReviewReportPage() {
       {RUNNING.has(shownStatus) && (
         <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
           审查已在独立 worker 进程排队/执行（
-          {shownStatus === "pending" ? "排队中" : "双通道分析中"}），页面每 3 秒轮询一次状态。
+          {shownStatus === "pending" ? "排队中" : "双通道分析中"}），页面每 3
+          秒轮询一次状态。
           {live?.heartbeatAt && (
             <span className="ml-1 text-blue-700">
               最近心跳 {new Date(live.heartbeatAt).toLocaleTimeString()}
             </span>
           )}
           <div className="mt-1 text-xs text-blue-700">
-            API 重启不影响本轮审查；长时间无心跳时巡检会把它判定为失败，届时可重新发起。
+            API
+            重启不影响本轮审查；长时间无心跳时巡检会把它判定为失败，届时可重新发起。
           </div>
         </div>
       )}
@@ -518,9 +526,7 @@ export default function ReviewReportPage() {
           </Card>
 
           {(report.referenceCases?.length ?? 0) > 0 && (
-            <Card
-              title="同类违规的监管罚单（类比参考，不是法条依据）"
-            >
+            <Card title="同类违规的监管罚单（类比参考，不是法条依据）">
               <p className="mb-2 text-xs text-slate-500">
                 这些条目只能回答“同类表述已被罚过”，不能支撑“本条违反某法某条”，
                 因此不进引用清单，也不参与引用核验。
@@ -539,7 +545,9 @@ export default function ReviewReportPage() {
                         <span className="text-slate-500">{item.decidedOn}</span>
                       ) : null}
                       {item.penaltyBody ? (
-                        <span className="text-slate-500">{item.penaltyBody}</span>
+                        <span className="text-slate-500">
+                          {item.penaltyBody}
+                        </span>
                       ) : null}
                       {item.isSample ? (
                         <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800">
