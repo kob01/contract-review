@@ -67,6 +67,8 @@ class OpenAICompatibleProvider:
         self._temperature = settings.llm_temperature if temperature is None else temperature
         self._max_tokens = settings.llm_max_tokens if max_tokens is None else max_tokens
         self.model = settings.llm_model if model is None else model
+        #: 供审查记录快照：记录本次运行真实生效的思考深度，而不是“当时 .env 里写了什么”
+        self.reasoning_effort = reasoning_effort or "default"
         # 思考深度开关只在显式非 default 时下发：部分供应商不认识这个字段，
         # 无条件带上会让整个调用 400
         self._extra_body = (
@@ -147,3 +149,11 @@ class OpenAICompatibleProvider:
                 await asyncio.sleep(2 ** (attempt - 1))
 
         raise LLMError(f"LLM 调用在 3 次重试后仍然失败：{last_error}") from last_error
+
+    async def aclose(self) -> None:
+        """关闭 OpenAI 客户端的 HTTP 连接池。
+
+        供应商已经是进程级单例，不关就是每次重建都留下一堆连接：
+        健康检查接口曾经每探测一次新建一个 AsyncOpenAI 且不关闭，高并发下先耗完 FD。
+        """
+        await self._client.close()

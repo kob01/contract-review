@@ -36,11 +36,22 @@ class LLMProvider(Protocol):
 
     name: str
     model: str
+    #: 本次调用实际使用的思考深度（`default` = 不下发该参数，沿用供应商默认）。
+    #: 审查记录需要把它存成快照：思考深度是配置，两次运行可能不同，不存就无法复盘
+    reasoning_effort: str
 
     async def complete_json(self, *, system_prompt: str, user_prompt: str) -> LLMResult:
         """以 JSON 模式补全，返回已解析的字典。
 
         实现必须在无法得到合法 JSON 时抛出 `LLMError`，而不是静默返回空对象，
         否则上层会把"模型故障"误判成"合同无风险"。
+        """
+        ...
+
+    async def aclose(self) -> None:
+        """释放底层 HTTP 连接。
+
+        供应商对象现在是进程级单例，单例就必须能被关掉：
+        否则健康检查与任务重提会把连接池越积越多。
         """
         ...

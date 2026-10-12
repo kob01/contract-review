@@ -21,6 +21,10 @@ from app.services.rules.metrics import FLAG_PATTERNS  # 与规则引擎共用同
 
 _PROVISION_RE = re.compile(r"- \[#(?P<pid>[0-9a-fA-F-]+)\] 《(?P<law>[^》]+)》(?P<article>\S*)")
 _METRIC_RATE_RE = re.compile(r"(?P<label>[^：:]{0,24})：(?P<value>[0-9.]+)%")
+#: 防注入分隔标签下的单条条款正文；逐块扫描才能保证 excerpt 是原文片段而不是跨条款窗口
+_CLAUSE_BLOCK_RE = re.compile(
+    r'<clause index="(?P<index>[0-9]+)"[^>]*>(?P<body>.*?)</clause>', re.DOTALL
+)
 
 #: 特征键 → 条款分类
 _CATEGORY_BY_KEY: dict[str, str] = {
@@ -62,6 +66,8 @@ class MockLLMProvider:
 
     def __init__(self, model_label: str = "mock-compliance-heuristic") -> None:
         self.model = model_label
+        #: 启发式不调模型，没有思考深度可言；占位值避免下游把它当成真实档位
+        self.reasoning_effort = "none"
 
     async def complete_json(self, *, system_prompt: str, user_prompt: str) -> LLMResult:
         started = time.perf_counter()
@@ -91,6 +97,10 @@ class MockLLMProvider:
                 total_tokens=len(system_prompt + user_prompt) // 2 + len(findings) * 140,
             ),
         )
+
+    async def aclose(self) -> None:
+        """无连接可释放；保留接口一致性，让上层可以无条件关闭。"""
+        return None
 
     # ---------- 提示词解析 ----------
 
@@ -124,24 +134,30 @@ class MockLLMProvider:
     ) -> list[dict[str, Any]]:
         findings: list[dict[str, Any]] = []
 
-        for key, label, pattern, guidance in FLAG_PATTERNS:
-            match = re.search(pattern, user_prompt)
-            if not match:
-                continue
-            excerpt = self._excerpt_around(user_prompt, match)
-            findings.append(
-                self._finding(
-                    risk_level="high" if key in _HIGH_RISK_KEYS else "medium",
-                    category=_CATEGORY_BY_KEY.get(key, ClauseCategory.OTHER.value),
-                    title=f"{label}（启发式命中）",
-                    excerpt=excerpt,
-                    analysis=f"{guidance} 本结论由离线 Mock 供应商给出，未经模型语义判断。",
-                    suggestion="由法务确认条款表述是否属于监管禁止或失衡安排，并按红线库建议改写。",
-                    confidence=0.7,
-                    provisions=provisions,
-                    hint=label,
+        # 新提示词把条款装在 <clause> 里：逐块扫描，命中窗口不会跨到下一条条款，
+        # excerpt 也就仍是能在原文里逐字找到的片段
+        bodies = [match.group("body") for match in _CLAUSE_BLOCK_RE.finditer(user_prompt)]
+        scanned = bodies or [user_prompt]
+
+        for text in scanned:
+            for key, label, pattern, guidance in FLAG_PATTERNS:
+                match = re.search(pattern, text)
+                if not match:
+                    continue
+                excerpt = self._excerpt_around(text, match)
+                findings.append(
+                    self._finding(
+                        risk_level="high" if key in _HIGH_RISK_KEYS else "medium",
+                        category=_CATEGORY_BY_KEY.get(key, ClauseCategory.OTHER.value),
+                        title=f"{label}（启发式命中）",
+                        excerpt=excerpt,
+                        analysis=f"{guidance} 本结论由离线 Mock 供应商给出，未经模型语义判断。",
+                        suggestion="由法务确认条款表述是否属于监管禁止或失衡安排，并按红线库建议改写。",
+                        confidence=0.7,
+                        provisions=provisions,
+                        hint=label,
+                    )
                 )
-            )
 
         for label, value in metrics:
             if value <= 0.24 or "年化" not in label:

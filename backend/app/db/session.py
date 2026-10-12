@@ -47,6 +47,8 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "judge_call_count": "INTEGER NOT NULL DEFAULT 0",
         "judge_failed_count": "INTEGER NOT NULL DEFAULT 0",
         "retrieval_channels": "JSONB NOT NULL DEFAULT '[]'::jsonb",
+        # 僵尸巡检的判定依据：没有它就只能拿 updated_at 猜任务是否还在跑
+        "heartbeat_at": "TIMESTAMPTZ",
     },
     "review_findings": {
         "judge_verdict": "JSONB NOT NULL DEFAULT '{}'::jsonb",
@@ -182,6 +184,16 @@ async def init_models() -> None:
     await ensure_added_columns()
     await align_vector_dimensions()
     await ensure_vector_indexes()
+
+
+async def dispose_engine() -> None:
+    """进程退出时释放连接池里的所有连接。
+
+    不关池会留下两种隐形代价：一是已关闭事件循环里挂着可用连接（重启
+    lifespan、跑集成测试、`--reload` 换 loop 时都会碰上 “Event loop is closed”）；
+    二是退出阶段无法将连接干净归还给 Postgres。引擎是模块级单例，所以也只能在这里统一关。
+    """
+    await engine.dispose()
 
 
 async def probe_database() -> str:

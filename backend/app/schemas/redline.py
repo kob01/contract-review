@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import date
 
 from app.models.enums import ClauseCategory, ContractKind, MetricOperator, RiskLevel
 from app.schemas.common import CamelModel
@@ -100,7 +101,10 @@ class RuleDryRunResponse(CamelModel):
 
 
 class ThresholdSnapshot(CamelModel):
-    """当前生效的监管阈值口径，报告页需展示以免误读。"""
+    """当前生效的监管阈值口径，报告页需展示以免误读。
+
+    保留几个固定字段是为了历史前端与报告不用改；真正可编辑的清单看 `items`。
+    """
 
     lpr_one_year_rate: float
     lpr_multiple: float
@@ -108,3 +112,19 @@ class ThresholdSnapshot(CamelModel):
     regulatory_cost_ceiling: float
     historical_hard_ceiling: float
     confidence_routing_threshold: float
+    #: 逐条口径：来源（db/settings）、生效日、维护人与合法区间
+    items: list[dict] = []
+
+
+class ThresholdUpdateItem(CamelModel):
+    key: str
+    value: float
+    #: 口径生效日（LPR 按月更新时必须记清“从哪天起算”），不填则取今天
+    effective_on: date | None = None
+
+
+class ThresholdUpdateRequest(CamelModel):
+    """一批阈值口径调整；整批校验，不合法的直接拒收，不留半截状态。"""
+
+    items: list[ThresholdUpdateItem]
+    updated_by: str = "legal"

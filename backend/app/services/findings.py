@@ -38,6 +38,8 @@ class CandidateFinding:
     char_start: int | None = None
     char_end: int | None = None
     citations: list[dict] = field(default_factory=list)
+    #: 同类违规的监管罚单 id（类比参考，不是法条依据），仅在 RAG_USE_CASES 打开时非空
+    similar_case_ids: list[str] = field(default_factory=list)
     llm_confidence: float = 0.0
     rule_confidence: float = 0.0
     hard_block: bool = False

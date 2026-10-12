@@ -73,6 +73,16 @@ export default function FindingCard({
     thresholdDesc?: string;
     derivation?: string;
   };
+  // 复核裁定是“第二道闸”的结果，不能只存在库里：进人工队列的理由用户必须看得见
+  const judge = (finding.judgeVerdict ?? {}) as {
+    judged?: boolean;
+    agree?: boolean;
+    citationOk?: boolean;
+    suggestedRiskLevel?: string | null;
+    confidence?: number;
+    reason?: string;
+    judgedBy?: string;
+  };
 
   return (
     <article
@@ -141,6 +151,45 @@ export default function FindingCard({
             <div className="mt-1 text-slate-500">推导：{metric.derivation}</div>
           )}
         </div>
+      )}
+
+      {(judge.judged !== undefined || judge.reason) && (
+        <div
+          className={`mt-3 rounded-lg px-3 py-2 text-xs ${
+            judge.judged === false
+              ? "bg-slate-50 text-slate-600"
+              : judge.agree === false
+                ? "bg-orange-50 text-orange-800"
+                : "bg-emerald-50/70 text-emerald-800"
+          }`}
+        >
+          <span className="font-semibold">
+            {judge.judged === false
+              ? "未复核："
+              : judge.agree === false
+                ? "复核质疑："
+                : "复核通过："}
+          </span>
+          {judge.reason || "—"}
+          {typeof judge.confidence === "number" && (
+            <span className="ml-1 opacity-70">
+              （裁定把握 {Math.round(judge.confidence * 100)}%）
+            </span>
+          )}
+          {judge.judged !== false && (
+            <div className="mt-1 text-[11px] opacity-70">
+              复核通道：{judge.judgedBy || "—"}
+              {typeof judge.suggestedRiskLevel === "string" &&
+                ` · 建议等级 ${judge.suggestedRiskLevel}（等级以规则引擎为准，仅记录不改写）`}
+            </div>
+          )}
+        </div>
+      )}
+
+      {(finding.similarCaseIds?.length ?? 0) > 0 && (
+        <p className="mt-2 text-[11px] text-slate-500">
+          同类违规参考罚单 {finding.similarCaseIds?.length} 条（仅类比，不作法条依据）
+        </p>
       )}
 
       <footer className="mt-3 flex flex-wrap items-center justify-between gap-3">

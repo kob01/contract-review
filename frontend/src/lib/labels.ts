@@ -101,6 +101,7 @@ export const humanReviewTone: Record<HumanReviewStatus, string> = {
 export const reasonLabels: Record<HumanReviewReason, string> = {
   low_confidence: "置信度未达标",
   rule_llm_conflict: "双通道结论冲突",
+  judge_disputed: "复核模型不认可或把握不足",
   high_risk_mandatory: "高风险强制确认",
   unverified_citation: "引用依据未核验",
   metric_missing: "关键数值无法抽取",

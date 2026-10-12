@@ -18,12 +18,19 @@ from app.schemas.redline import (
     RuleDryRunResponse,
     RuleHitOut,
     ThresholdSnapshot,
+    ThresholdUpdateRequest,
 )
 from app.services.parser.extractor import ExtractedDocument, PageText
 from app.services.parser.segmenter import segmentize
 from app.services.rules.engine import RuleEngine
 from app.services.rules.metrics import extract_metrics
 from app.services.rules.seed import load_active_rules
+from app.services.rules.thresholds import (
+    Thresholds,
+    ThresholdValueError,
+    load_thresholds,
+    upsert_thresholds,
+)
 
 router = APIRouter(prefix="/redlines", tags=["redlines"])
 
@@ -118,21 +125,51 @@ async def delete_rule(code: str, session: AsyncSession = Depends(get_db)) -> Non
 
 
 @router.get("/thresholds", response_model=ThresholdSnapshot)
-async def thresholds(app_settings: Settings = Depends(get_settings)) -> ThresholdSnapshot:
-    """当前生效的阈值口径。
+async def thresholds(
+    session: AsyncSession = Depends(get_db),
+    app_settings: Settings = Depends(get_settings),
+) -> ThresholdSnapshot:
+    """当前生效的阈值口径（库内记录优先于环境变量）。
 
     报告页必须展示这几个数：同一份合同在 LPR 调整后结论会不同，
     不展示口径等于把判断标准藏起来。
     """
+    loaded = await load_thresholds(session, app_settings)
+    return _snapshot(loaded)
+
+
+@router.put("/thresholds", response_model=ThresholdSnapshot)
+async def update_thresholds(
+    payload: ThresholdUpdateRequest,
+    session: AsyncSession = Depends(get_db),
+    app_settings: Settings = Depends(get_settings),
+) -> ThresholdSnapshot:
+    """批量调整阈值口径，不用改代码、不用重发版。
+
+    内置规则的“能不能改”有红线库自己的约束（不可删除、需 toggle），
+    但这几个行情数本身就是需要定期维护的数据，不应靠发布流程驱动。
+    """
+    updates = [(item.key, item.value, item.effective_on) for item in payload.items]
+    try:
+        loaded = await upsert_thresholds(
+            session, updates, updated_by=payload.updated_by.strip() or "legal", settings=app_settings
+        )
+    except ThresholdValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
+        ) from exc
+    return _snapshot(loaded)
+
+
+def _snapshot(loaded: Thresholds) -> ThresholdSnapshot:
     return ThresholdSnapshot(
-        lpr_one_year_rate=app_settings.lpr_one_year_rate,
-        lpr_multiple=app_settings.lpr_multiple,
-        judicial_protection_ceiling=round(
-            app_settings.lpr_one_year_rate * app_settings.lpr_multiple, 6
-        ),
-        regulatory_cost_ceiling=app_settings.regulatory_cost_ceiling,
-        historical_hard_ceiling=app_settings.historical_hard_ceiling,
-        confidence_routing_threshold=app_settings.confidence_routing_threshold,
+        lpr_one_year_rate=loaded.lpr_one_year_rate,
+        lpr_multiple=loaded.lpr_multiple,
+        judicial_protection_ceiling=loaded.judicial_protection_ceiling,
+        regulatory_cost_ceiling=loaded.regulatory_cost_ceiling,
+        historical_hard_ceiling=loaded.historical_hard_ceiling,
+        confidence_routing_threshold=loaded.confidence_routing_threshold,
+        items=loaded.rows(),
     )
 
 
@@ -162,7 +199,9 @@ async def dry_run(
         wanted = set(payload.rule_codes)
         rules = [rule for rule in rules if rule.code in wanted]
 
-    evaluation = RuleEngine(rules, app_settings).evaluate(
+    # 试算跟真实审查同一个口径入口：改完阈值当场能看到它对样本合同的影响
+    thresholds = await load_thresholds(session, app_settings)
+    evaluation = RuleEngine(rules, app_settings, thresholds).evaluate(
         metrics,
         full_text=document.text,
         segments=segments,

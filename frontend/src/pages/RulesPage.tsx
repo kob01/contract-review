@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiErrorMessage } from "@/api/client";
 import { dryRunRules, getThresholds, listRules, toggleRule } from "@/api";
 import { Card, Empty, ErrorNote, RiskBadge } from "@/components/badges";
+import ThresholdEditor from "@/components/ThresholdEditor";
 import { formatPercent } from "@/lib/labels";
 import type {
   RedLineRule,
@@ -163,6 +164,9 @@ export default function RulesPage() {
             ))}
           </div>
         </Card>
+
+        {/* 阈值口径编辑器：改数不等发版，改完用右侧试算做回归 */}
+        <ThresholdEditor items={thresholds?.items ?? []} onChanged={refresh} />
       </div>
 
       <div className="space-y-4">

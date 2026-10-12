@@ -8,6 +8,8 @@ export type ContractStatus =
   | "reviewed"
   | "failed";
 export type ReviewStatus = "pending" | "running" | "succeeded" | "failed";
+/** 复核执行形态：llm = 叫了复核模型；rule_check = 确定性规则复核；disabled = 本次未复核 */
+export type JudgeMode = "llm" | "rule_check" | "disabled";
 export type RiskLevel = "high" | "medium" | "low" | "none";
 export type ContractKind =
   | "consumer_loan"
@@ -31,6 +33,7 @@ export type HumanReviewStatus =
 export type HumanReviewReason =
   | "low_confidence"
   | "rule_llm_conflict"
+  | "judge_disputed"
   | "high_risk_mandatory"
   | "unverified_citation"
   | "metric_missing"
@@ -145,6 +148,10 @@ export interface Finding {
   charEnd?: number | null;
   citations: Citation[];
   hasUnverifiedCitation: boolean;
+  /** 同类违规的监管罚单 id（仅在 RAG_USE_CASES 打开时非空） */
+  similarCaseIds?: string[];
+  /** 复核裁定快照：{judged, agree, citationOk, suggestedRiskLevel, confidence, reason, judgedBy} */
+  judgeVerdict?: Record<string, unknown>;
   humanReviewStatus: HumanReviewStatus;
   humanReviewerId?: string | null;
   humanComment?: string | null;
@@ -159,6 +166,12 @@ export interface ReviewSummary {
   llmModel: string;
   embeddingModel: string;
   promptVersion: string;
+  /** 复核通道；空串表示本次未执行复核，rule-check-v1 表示走了确定性规则复核 */
+  judgeModel?: string;
+  judgeCallCount?: number;
+  judgeFailedCount?: number;
+  /** 本次实际参与召回的通道（降级时必须可见） */
+  retrievalChannels?: string[];
   riskScore: number;
   summary: string;
   highRiskCount: number;
@@ -178,13 +191,46 @@ export interface ReviewSummary {
   createdAt: string;
   startedAt?: string | null;
   finishedAt?: string | null;
+  /** 存活心跳：排队/执行阶段区分“在跑”与“已死” */
+  heartbeatAt?: string | null;
+}
+
+/** 轮询用的轻响应，避免每 3 秒拉一次完整报告。 */
+export interface ReviewStatusResponse {
+  id: string;
+  contractId: string;
+  status: ReviewStatus;
+  elapsedSeconds: number;
+  errorMessage?: string | null;
+  pendingHumanCount: number;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  heartbeatAt?: string | null;
 }
 
 export interface ReviewReport {
   review: ReviewSummary;
   findings: Finding[];
   referenceProvisions: Citation[];
+  /** 同类违规的监管罚单快照（类比参考，不是法条依据） */
+  referenceCases?: ReferenceCase[];
   metricWarnings: string[];
+}
+
+/** 监管罚单快照，字段与后端 `RetrievedCase.to_snapshot()` 对齐。 */
+export interface ReferenceCase {
+  caseId: string;
+  orgName: string;
+  summary: string;
+  penaltyContent?: string | null;
+  caseNo?: string | null;
+  penaltyBody?: string | null;
+  decidedOn?: string | null;
+  violationTypes?: string[];
+  penaltyAmount?: number | null;
+  sourceUrl?: string | null;
+  isSample?: boolean;
+  score?: number;
 }
 
 export interface ReviewRunRequest {
@@ -283,6 +329,22 @@ export interface ThresholdSnapshot {
   regulatoryCostCeiling: number;
   historicalHardCeiling: number;
   confidenceRoutingThreshold: number;
+  /** 可编辑口径清单（含来源、生效日与维护人） */
+  items?: ThresholdItem[];
+}
+
+export interface ThresholdItem {
+  key: string;
+  label: string;
+  unit: string;
+  value: number;
+  min: number;
+  max: number;
+  description: string;
+  /** db = 库内生效值；settings = 仍取环境变量默认 */
+  source: string;
+  effectiveOn?: string | null;
+  updatedBy?: string | null;
 }
 
 export interface LegalProvision {
@@ -311,8 +373,28 @@ export interface HealthResponse {
   database: string;
   llmProvider: string;
   llmModel: string;
+  /** 主审通道（环节3/4）的思考深度；default = 沿用供应商最深档 */
+  llmReasoningEffort: string;
+  /** 复核通道（环节7）的思考深度；空串表示本次未启用独立复核 */
+  judgeReasoningEffort: string;
+  judgeModel: string;
+  judgeMode: JudgeMode;
+  /** false = 复核与主审同源，不构成独立信号（回音壁） */
+  judgeIndependent: boolean;
   embeddingProvider: string;
   embeddingIsMock: boolean;
+  sparseEnabled?: boolean;
+  rerankEnabled?: boolean;
+  casesEnabled?: boolean;
+  queueEnabled: boolean;
+  queueState: string;
+  /** 队列积压；null = 无法确认 */
+  queueDepth?: number | null;
+  /** 是否有活着的 worker 在消费（ARQ worker 心跳键）；null = 无法确认 */
+  queueWorkerAlive?: boolean | null;
+  zombieTimeoutSeconds: number;
   knowledgeProvisionCount: number;
   redLineRuleCount: number;
+  /** “能跑但不该上线”的配置口径清单 */
+  configWarnings?: string[];
 }

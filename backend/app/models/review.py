@@ -80,6 +80,10 @@ class ContractReview(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: 存活心跳：由 worker 在任务执行期间周期性刷新。
+    #: 巡检不能拿 updated_at 判僵尸：一轮审查可能十几分钟不写库，
+    #: 没有独立心跳字段就只能“把慢任务当死任务杀掉”或者“让死任务假活几小时”
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     contract: Mapped[Contract] = relationship(back_populates="reviews")
     findings: Mapped[list[ReviewFinding]] = relationship(
@@ -141,6 +145,7 @@ class ReviewFinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     char_end: Mapped[int | None] = mapped_column(Integer)
 
     citations: Mapped[list[dict]] = mapped_column(JSONType, default=list, nullable=False)
+    #: 同类违规的监管罚单 id（类比参考，仅在 RAG_USE_CASES 打开时非空）
     similar_case_ids: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
 
     # ---------- 结论复核（LLM judge）----------

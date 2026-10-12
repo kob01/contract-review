@@ -28,6 +28,23 @@ services:
       timeout: 5s
       retries: 12
 
+  redis:
+    # 任务队列后端（ARQ）。无法直连 Docker Hub 时改 REDIS_IMAGE 指向镜像站
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    container_name: contract-review-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      # 只监听本机：队列不是对外服务
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   backend:
     build:
       context: ./backend
@@ -40,14 +57,46 @@ services:
         required: false
     environment:
       DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
+      REDIS_URL: redis://redis:6379/0
       # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8081
       CORS_ORIGINS: http://localhost:5173,http://localhost:8081
+      UPLOAD_DIR: /app/storage/contracts
+      # API 进程只接单与读库，可以开多 worker；每个进程一个连接池，
+      # worker 数 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) 不要超过 Postgres max_connections
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-2}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - contract-storage:/app/storage
+
+  worker:
+    # 审查任务执行进程：与 API 同镜像不同 command。
+    # 分开是因为分钟级长任务放在 Web 进程里，一次发版就会把在跑的任务带走
+    build:
+      context: ./backend
+    container_name: contract-review-worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.tasks.worker"]
+    env_file:
+      - .env
+      - path: ../.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
+      REDIS_URL: redis://redis:6379/0
       UPLOAD_DIR: /app/storage/contracts
     depends_on:
       db:
         condition: service_healthy
-    ports:
-      - "8000:8000"
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
     volumes:
       - contract-storage:/app/storage
 
@@ -65,3 +114,4 @@ services:
 volumes:
   pgdata:
   contract-storage:
+  redisdata:

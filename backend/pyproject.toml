@@ -30,6 +30,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "elasticsearch>=8.15,<9",
     "jieba>=0.42",
+    "arq>=0.28.0",
 ]
 
 [dependency-groups]
@@ -43,6 +44,10 @@ dev = [
 
 [tool.uv]
 package = false
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
 
 [tool.ruff]
 line-length = 120

@@ -15,7 +15,7 @@ from app.models.review import ContractReview, ReviewFinding
 from app.schemas.contract import ContractBrief, ContractDetail, ContractSegment, MetricEvidence
 from app.schemas.knowledge import EnforcementCaseOut, ProvisionOut
 from app.schemas.redline import RedLineRuleOut
-from app.schemas.review import FindingOut, HumanReviewTaskOut, ReviewSummary
+from app.schemas.review import FindingOut, HumanReviewTaskOut, ReviewStatusOut, ReviewSummary
 
 
 def _latest_review(contract: Contract) -> ContractReview | None:
@@ -66,6 +66,21 @@ def to_review_summary(review: ContractReview) -> ReviewSummary:
     return ReviewSummary.model_validate(review)
 
 
+def to_review_status_out(review: ContractReview) -> ReviewStatusOut:
+    """轮询用的轻映射：只取状态与时间戳，不碰 findings 关系。"""
+    return ReviewStatusOut(
+        id=review.id,
+        contract_id=review.contract_id,
+        status=review.status,
+        elapsed_seconds=review.elapsed_seconds,
+        error_message=review.error_message,
+        pending_human_count=review.pending_human_count,
+        started_at=review.started_at,
+        finished_at=review.finished_at,
+        heartbeat_at=review.heartbeat_at,
+    )
+
+
 def to_finding_out(finding: ReviewFinding) -> FindingOut:
     return FindingOut(
         id=finding.id,
@@ -88,6 +103,7 @@ def to_finding_out(finding: ReviewFinding) -> FindingOut:
         char_start=finding.char_start,
         char_end=finding.char_end,
         citations=finding.citations or [],
+        similar_case_ids=finding.similar_case_ids or [],
         has_unverified_citation=finding.has_unverified_citation,
         judge_verdict=finding.judge_verdict or {},
         human_review_status=finding.human_review_status,

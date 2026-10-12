@@ -1,16 +1,21 @@
-"""审查接口：发起、查询历史、拉取报告。"""
+"""审查接口：发起、查询历史、拉取报告。
+
+发起接口只做两件事：落一条 pending 的审查记录 + 投队列，立刻返回 202。
+分钟级的分析不在 Web 进程里跑，否则一次发版就会把在跑的审查带走。
+"""
 
 from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_db
-from app.api.mappers import to_finding_out, to_review_summary
+from app.api.mappers import to_finding_out, to_review_status_out, to_review_summary
+from app.core.logging import get_logger
 from app.models.contract import Contract
 from app.models.enums import ContractStatus, ReviewStatus
 from app.models.review import ContractReview
@@ -20,9 +25,12 @@ from app.schemas.review import (
     ReviewListResponse,
     ReviewReport,
     ReviewRunRequest,
+    ReviewStatusOut,
     ReviewSummary,
 )
-from app.tasks.review_runner import run_review_task
+from app.tasks.queue import REJECTED, enqueue_review
+
+logger = get_logger(__name__)
 
 router = APIRouter(tags=["reviews"])
 
@@ -32,6 +40,9 @@ _UNREVIEWABLE = {
     ContractStatus.FAILED.value,
 }
 
+#: 同一份合同同时只允许一轮在跑的审查
+_IN_FLIGHT = [ReviewStatus.PENDING.value, ReviewStatus.RUNNING.value]
+
 
 @router.post(
     "/contracts/{contract_id}/reviews",
@@ -40,13 +51,13 @@ _UNREVIEWABLE = {
 )
 async def start_review(
     contract_id: uuid.UUID,
-    background: BackgroundTasks,
     payload: ReviewRunRequest | None = None,
     session: AsyncSession = Depends(get_db),
 ) -> ReviewSummary:
-    """发起一次审查，立即返回任务凭据，执行放到后台。
+    """发起一次审查：写记录 + 入队，执行放到 worker 进程。
 
     历史不覆盖：每轮审查都新增一条 `ContractReview`，合规场景需要"当时怎么判的"可追溯。
+    已有在跑的审查时不重复开一轮：重复入队等于重复付费与两份互相矛盾的报告。
     """
     contract = await session.get(Contract, contract_id)
     if contract is None:
@@ -57,6 +68,17 @@ async def start_review(
             detail=f"合同当前状态为 {contract.status}，需先完成解析才能审查",
         )
 
+    running = await session.scalar(
+        select(ContractReview)
+        .where(ContractReview.contract_id == contract_id)
+        .where(ContractReview.status.in_(_IN_FLIGHT))
+        .order_by(ContractReview.created_at.desc())
+        .limit(1)
+    )
+    if running is not None:
+        logger.info("合同 %s 已有在跑的审查 %s，忽略重复发起", contract_id, running.id)
+        return to_review_summary(running)
+
     request = payload or ReviewRunRequest()
     review = ContractReview(
         contract_id=contract.id,
@@ -66,7 +88,17 @@ async def start_review(
     session.add(review)
     await session.commit()
 
-    background.add_task(run_review_task, review.id, request)
+    outcome = await enqueue_review(review.id, request)
+    if outcome == REJECTED:
+        # 队列不可用且回退已关：把已建的记录写成失败并告知原因，不留 pending 孤儿
+        review.status = ReviewStatus.FAILED.value
+        review.error_message = "任务队列不可用且已关闭进程内回退（QUEUE_FALLBACK_IN_PROCESS=false）"
+        await session.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="审查队列不可用，请启动 worker 与 Redis，或开启进程内回退后重试",
+        )
+
     return to_review_summary(review)
 
 
@@ -100,6 +132,21 @@ async def get_review(
     return to_review_summary(review)
 
 
+@router.get("/reviews/{review_id}/status", response_model=ReviewStatusOut)
+async def get_review_status(
+    review_id: uuid.UUID, session: AsyncSession = Depends(get_db)
+) -> ReviewStatusOut:
+    """轮询专用轻响应：只回状态与时间戳。
+
+    排队阶段报告里的结论、引用、条文快照全都不存在，
+    拿完整报告当轮询接口就是把报告页自己变成负载源。
+    """
+    review = await session.get(ContractReview, review_id)
+    if review is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="审查任务不存在")
+    return to_review_status_out(review)
+
+
 @router.get("/reviews/{review_id}/report", response_model=ReviewReport)
 async def get_review_report(
     review_id: uuid.UUID, session: AsyncSession = Depends(get_db)
@@ -127,5 +174,7 @@ async def get_review_report(
         reference_provisions=[
             CitationOut.model_validate(item) for item in review.retrieved_provisions or []
         ],
+        # 罚单快照存在 run_options 里：它是类比参考，不进引用核验链路
+        reference_cases=list((review.run_options or {}).get("retrievedCases", [])),
         metric_warnings=list((contract.extracted_metrics or {}).get("warnings", [])),
     )

@@ -69,6 +69,8 @@ class ReviewFindingDraft(CamelModel):
     segment_index: int | None = None
     citations: list[CitationDraft] = []
     rule_code: str | None = None
+    #: 模型回指的参考判例 id；不在本轮检索清单内的 id 在管道里直接丢弃
+    similar_case_ids: list[str] = []
 
 
 class ReviewBatchDraft(CamelModel):
@@ -142,6 +144,8 @@ class FindingOut(CamelModel):
 
     citations: list[dict] = []
     has_unverified_citation: bool = False
+    #: 同类违规的监管罚单 id（仅在 RAG_USE_CASES 打开时非空）
+    similar_case_ids: list[str] = []
 
     #: 复核裁定（{judged, agree, citationOk, suggestedRiskLevel, confidence, reason, judgedBy}）
     judge_verdict: dict = {}
@@ -160,7 +164,7 @@ class ReviewSummary(CamelModel):
     llm_model: str
     embedding_model: str
     prompt_version: str
-    #: 复核模型；空串表示本次未执行结论复核
+    #: 复核通道；空串表示本次未执行复核，`rule-check-v1` 表示走了确定性规则复核
     judge_model: str = ""
     judge_call_count: int = 0
     judge_failed_count: int = 0
@@ -185,6 +189,26 @@ class ReviewSummary(CamelModel):
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    #: 存活心跳：巡检靠它区分“在跑”与“僵尸”，没有它就只能拿 updated_at 猜
+    heartbeat_at: datetime | None = None
+
+
+class ReviewStatusOut(CamelModel):
+    """轮询用的轻响应。
+
+    报告页以前每 3 秒拉一次完整报告（结论 + 引用 + 条文快照），
+    排队阶段这些数据根本不存在，轮询自身就成了新的负载源。
+    """
+
+    id: uuid.UUID
+    contract_id: uuid.UUID
+    status: ReviewStatus
+    elapsed_seconds: float = 0.0
+    error_message: str | None = None
+    pending_human_count: int = 0
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    heartbeat_at: datetime | None = None
 
 
 class ReviewReport(CamelModel):
@@ -192,6 +216,8 @@ class ReviewReport(CamelModel):
     findings: list[FindingOut]
     #: 检索到但未被任何结论引用的条文，前端"参考依据"区展示
     reference_provisions: list[CitationOut] = []
+    #: 同类违规的监管罚单快照（仅在 RAG_USE_CASES 打开时非空），只作类比参考
+    reference_cases: list[dict] = []
     metric_warnings: list[str] = []
 
 

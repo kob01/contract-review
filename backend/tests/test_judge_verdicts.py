@@ -8,7 +8,12 @@ from __future__ import annotations
 
 from app.models.enums import FindingSource, HumanReviewReason, HumanReviewStatus, RiskLevel
 from app.services.findings import CandidateFinding, apply_judge_verdicts
-from app.services.judge import _plan_batches
+from app.services.judge import (
+    RULE_CHECK_MODEL,
+    _plan_batches,
+    rule_check_verdict,
+    run_rule_check_judge,
+)
 
 
 def make_item(**overrides) -> CandidateFinding:
@@ -98,11 +103,78 @@ def test_judge_never_downgrades_risk_level():
 
 def test_batches_use_global_index():
     items = [make_item(title=f"结论 {index}") for index in range(5)]
-    batches = _plan_batches(items, max_items=2)
+    batches = _plan_batches(items, max_items=2, char_budget=9000)
     flat = [index for batch in batches for index, _ in batch]
     assert flat == [0, 1, 2, 3, 4]
     assert [len(batch) for batch in batches] == [2, 2, 1]
 
 
+def test_batches_split_on_char_budget_not_only_item_count():
+    """字符预算必须能单独切批：否则一批 12 条长分析会撞爆复核模型的上下文。"""
+    items = [make_item(title=f"结论 {index}", analysis="很长" * 400) for index in range(3)]
+    batches = _plan_batches(items, max_items=12, char_budget=1500)
+    assert [len(batch) for batch in batches] == [1, 1, 1]
+
+
 def test_empty_input_produces_no_batches():
-    assert _plan_batches([], max_items=3) == []
+    assert _plan_batches([], max_items=3, char_budget=9000) == []
+
+
+# ---------- 确定性规则复核（回音壁降级）----------
+
+
+def test_rule_check_rejects_findings_without_verified_citation():
+    """引用全部未核验时不能判“成立”：同模型复核只会附和，硬信号不会。"""
+    item = make_item(citations=[{"lawName": "办法", "articleNo": "第十八条", "verified": False}])
+    verdict = rule_check_verdict(0, item)
+    assert verdict["agree"] is False
+    assert verdict["citation_ok"] is False
+
+
+def test_rule_check_rejects_uncited_and_unlocated_findings():
+    no_citation = rule_check_verdict(0, make_item(citations=[]))
+    assert no_citation["agree"] is False
+
+    unlocated = make_item(
+        source=FindingSource.LLM.value,
+        citations=[{"lawName": "民法典", "articleNo": "第六百七十条", "verified": True}],
+        located=False,
+    )
+    assert rule_check_verdict(1, unlocated)["agree"] is False
+
+
+def test_rule_check_accepts_rule_hit_with_verified_citation():
+    item = make_item(
+        citations=[{"lawName": "办法", "articleNo": "第十八条", "verified": True}],
+        rule_confidence=1.0,
+    )
+    verdict = rule_check_verdict(0, item)
+    assert verdict["agree"] is True
+    assert verdict["confidence"] >= 0.9
+
+
+def test_rule_check_marks_conflicting_channels_as_disputed():
+    """双通道定性冲突属“以规则为准但需人工确认”，不能当复核通过。"""
+    item = make_item(
+        cross_check_status="rule_overrides",
+        citations=[{"lawName": "办法", "articleNo": "第十八条", "verified": True}],
+    )
+    assert rule_check_verdict(0, item)["agree"] is False
+
+
+def test_rule_check_outcome_routes_disputed_into_human_review():
+    """降级复核写回后仍然“只加严”：不成立进人工队列，等级不变。"""
+    items = [make_item(citations=[]), make_item(title="已核验的一条", citations=[
+        {"lawName": "办法", "articleNo": "第十八条", "verified": True}
+    ])]
+    outcome = run_rule_check_judge(items)
+    assert outcome.model == RULE_CHECK_MODEL
+    assert outcome.executed
+
+    counts = apply_judge_verdicts(
+        items, outcome.verdicts, judge_model=outcome.model, min_confidence=0.6
+    )
+    assert counts["judged"] == 2
+    assert items[0].human_review_status == HumanReviewStatus.PENDING.value
+    assert items[0].risk_level == RiskLevel.HIGH.value
+    assert items[1].human_review_status == HumanReviewStatus.NOT_REQUIRED.value

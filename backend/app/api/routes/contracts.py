@@ -26,8 +26,8 @@ from app.services.contract_service import infer_contract_kind, parse_contract
 
 router = APIRouter(prefix="/contracts", tags=["contracts"])
 
-#: 上传的合同属于敏感商业资料，落盘文件名与原名分离，仅按 UUID 寻址
-_SAFE_SUFFIXES = {".pdf", ".docx", ".txt", ".md"}
+# 上传的合同属于敏感商业资料，落盘文件名与原名分离，仅按 UUID 寻址。
+# 允许的后缀只有一个真理源：`Settings.allowed_upload_suffixes`（已归一为小写带点）
 
 _DOC_CONTENT_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -55,10 +55,11 @@ async def upload_contract(
 ) -> ContractDetail:
     original_name = file.filename or "contract"
     suffix = Path(original_name).suffix.lower()
-    if suffix not in _SAFE_SUFFIXES:
+    if suffix not in app_settings.allowed_upload_suffixes:
         raise HTTPException(
             status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"不支持的文件类型 {suffix}，仅支持 {sorted(_SAFE_SUFFIXES)}",
+            detail=f"不支持的文件类型 {suffix or '（无后缀）'}，仅支持 "
+            f"{sorted(app_settings.allowed_upload_suffixes)}",
         )
 
     payload = await file.read()

@@ -38,6 +38,8 @@ class EmbeddingClient(Protocol):
 
     async def embed_query(self, text: str) -> list[float]: ...
 
+    async def aclose(self) -> None: ...
+
 
 def _check_dimensions(vectors: list[list[float]], expected: int, source: str) -> list[list[float]]:
     """维度不一致时直接报错，不能让错维向量写进 pgvector 列。"""
@@ -128,6 +130,9 @@ class OpenAICompatEmbeddings:
         (vector,) = await self.embed_texts([text])
         return vector
 
+    async def aclose(self) -> None:
+        await self._client.close()
+
 
 class HashingEmbeddings:
     """词哈希 + 计数的确定性向量，做过 L2 归一化，可用余弦距离比较。"""
@@ -143,6 +148,10 @@ class HashingEmbeddings:
 
     async def embed_query(self, text: str) -> list[float]:
         return self._encode(text)
+
+    async def aclose(self) -> None:
+        """哈希向量不连外部服务，无需释放。"""
+        return None
 
     def _encode(self, text: str) -> list[float]:
         vector = [0.0] * self.dimensions
@@ -232,3 +241,33 @@ def build_embedding_client(settings: Settings) -> EmbeddingClient:
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
     )
+
+
+#: 向量客户端也是进程级单例：每轮审查新建一个 httpx/OpenAI 客户端，
+#: 与“每次健康检查新建一个 LLM 客户端”是同一类泄露，因而不按请求新建
+_shared_client: EmbeddingClient | None = None
+_shared_key: str = ""
+
+
+def shared_embedder(settings: Settings) -> EmbeddingClient:
+    """取共享向量客户端；模型/端点/维度变了才重建。"""
+    global _shared_client, _shared_key
+
+    key = (
+        f"{settings.embedding_provider}::{settings.embedding_base_url}"
+        f"::{settings.embedding_model}::{settings.embedding_dimensions}"
+        f"::{settings.rag_use_mock_embedding}"
+    )
+    if _shared_client is None or _shared_key != key:
+        _shared_client = build_embedding_client(settings)
+        _shared_key = key
+    return _shared_client
+
+
+async def aclose_shared_embedder() -> None:
+    """应用关闭时释放向量侧连接。"""
+    global _shared_client, _shared_key
+    if _shared_client is not None:
+        await _shared_client.aclose()
+    _shared_client = None
+    _shared_key = ""

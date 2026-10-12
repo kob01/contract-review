@@ -27,7 +27,11 @@ from app.schemas.knowledge import (
     ReindexResult,
 )
 from app.services.ingestion.regulator import fetch_penalty_notices, source_available
-from app.services.rag.embeddings import EmbeddingClient, build_embedding_client, describe_embedding_backend
+from app.services.rag.embeddings import (
+    EmbeddingClient,
+    describe_embedding_backend,
+    shared_embedder,
+)
 from app.services.rag.ingest import (
     PLACEHOLDER_PREFIX,
     ProvisionInput,
@@ -44,7 +48,12 @@ logger = get_logger(__name__)
 
 
 def _embedder(app_settings: Settings) -> EmbeddingClient:
-    return build_embedding_client(app_settings)
+    """向量客户端走进程级单例。
+
+    以前每个知识接口请求都 `build_embedding_client` 新建一个 httpx/OpenAI 客户端
+    且不关闭，包括导入、搜索、重建这几个入口；同一份配置应该只建一份连接池。
+    """
+    return shared_embedder(app_settings)
 
 
 @router.get("/provisions", response_model=list[ProvisionOut])

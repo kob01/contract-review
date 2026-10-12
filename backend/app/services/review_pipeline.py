@@ -48,26 +48,33 @@ from app.services.findings import (
 )
 from app.services.judge import run_judge
 from app.services.llm.base import LLMError, LLMProvider
+from app.services.llm.factory import RULE_CHECK_MODEL, JudgeSlot
 from app.services.llm.prompts import (
     PROMPT_VERSION,
     build_system_prompt,
     build_user_prompt,
     describe_pending_rules,
     describe_rule_hits_for_prompt,
+    detect_injection_attempts,
+    restore_untrusted,
 )
 from app.services.parser.segmenter import batch_segments, locate_excerpt
 from app.services.rag.embeddings import EmbeddingClient
 from app.services.rag.rerank import RerankClient
-from app.services.rag.retriever import ProvisionRetriever, RetrievedProvision
-from app.services.rag.sparse import SparseSearchIndex
+from app.services.rag.retriever import (
+    ProvisionRetriever,
+    RetrievedCase,
+    RetrievedProvision,
+    build_token_index,
+    lexical_overlap,
+)
+from app.services.rag.sparse import SparseSearchIndex, atokenize
 from app.services.rules.engine import RuleEngine, RuleHit
 from app.services.rules.metrics import MetricSet, metric_summary_for_prompt
 from app.services.rules.seed import load_active_rules, rules_for_prompt
+from app.services.rules.thresholds import Thresholds, load_thresholds
 
 logger = get_logger(__name__)
-
-#: 进提示词的条文上限，再多就会挤占条款原文预算并稀释注意力
-_MAX_PROVISIONS_IN_PROMPT = 14
 
 
 class ReviewPipelineError(RuntimeError):
@@ -84,7 +91,8 @@ class ReviewPipeline:
         *,
         sparse: SparseSearchIndex | None = None,
         reranker: RerankClient | None = None,
-        judge: LLMProvider | None = None,
+        judge_slot: JudgeSlot | None = None,
+        session_factory=None,
     ) -> None:
         self._session = session
         self._provider = provider
@@ -92,7 +100,19 @@ class ReviewPipeline:
         self._settings = app_settings
         self._sparse = sparse
         self._reranker = reranker
-        self._judge = judge
+        #: 复核不再只是一个供应商对象：它带“本次到底复核了没有、是不是独立信号”
+        self._judge_slot = judge_slot or JudgeSlot()
+        #: 逐批检索需要多个并发会话，而 AsyncSession 不是并发安全的，
+        #: 因此每批借一个侧会话（延迟读取，避免导入时拉起引擎）
+        self._session_factory = session_factory
+
+    @property
+    def _side_factory(self):
+        if self._session_factory is not None:
+            return self._session_factory
+        from app.db.session import SessionLocal
+
+        return SessionLocal
 
     # ---------- 对外入口 ----------
 
@@ -134,11 +154,28 @@ class ReviewPipeline:
         review.status = ReviewStatus.RUNNING.value
         review.llm_model = self._provider.model
         review.embedding_model = f"{self._embedder.name}:{self._embedder.dimensions}"
-        #: 空串是有意保留的事实：本次没有独立复核模型
-        review.judge_model = self._judge.model if self._judge is not None else ""
+        #: 空串是有意保留的事实：本次没有独立复核通道；
+        #: `rule-check-v1` 则表示“没叫模型，但做了确定性复核”
+        review.judge_model = self._judge_slot.model
         review.prompt_version = PROMPT_VERSION
-        review.run_options = request.model_dump(mode="json", by_alias=True)
+        #: 思考档位属配置而不是请求参数，两次运行可能不同：与模型名一样固化成快照，
+        #: 事后才能回答“这条结论是在哪一档思考深度下出的、当时复核有没有真的跑”
+        options = request.model_dump(mode="json", by_alias=True)
+        options["thinkingDepth"] = {
+            "review": self._provider.reasoning_effort,
+            "judge": (
+                self._judge_slot.provider.reasoning_effort
+                if self._judge_slot.provider is not None
+                else ""
+            ),
+        }
+        #: 复核形态与是否同源必须固化：否则“glm 自己复核自己”与
+        #: “DeepSeek 复核 glm”在历史报告里会长得一模一样
+        options["judgeMode"] = self._judge_slot.mode
+        options["judgeIndependent"] = self._judge_slot.independent
+        review.run_options = options
         review.started_at = datetime.now(UTC)
+        review.heartbeat_at = datetime.now(UTC)
         review.error_message = None
         contract.status = ContractStatus.REVIEWING.value
 
@@ -171,7 +208,11 @@ class ReviewPipeline:
         if not rules:
             logger.warning("红线库为空，规则通道无法参与交叉校验")
 
-        evaluation = RuleEngine(rules, self._settings).evaluate(
+        # 阈值口径从库里的生效值读（法务可自助调整），不能只盯环境变量；
+        # 用的具体数值会归入本次审查快照，事后能回答“当时按哪个口径判的”
+        thresholds = await load_thresholds(self._session, self._settings)
+
+        evaluation = RuleEngine(rules, self._settings, thresholds).evaluate(
             metrics,
             full_text=full_text,
             segments=segments,
@@ -187,6 +228,17 @@ class ReviewPipeline:
         )
         weak_rules = await rules_for_prompt(self._session, evaluation.weak_signals)
 
+        # 合同正文是外部输入：先扫一轮“让审查系统忽略规则”这类注入措辞。
+        # 不丢弃正文（正文本身可能就是规避证据），但必须让运维看得到
+        injection_hits = detect_injection_attempts(full_text)
+        if injection_hits:
+            logger.warning(
+                "合同 %s 正文含疑似提示注入措辞 %s 处（仅记录，不删除原文）：%s",
+                contract.id,
+                len(injection_hits),
+                " | ".join(injection_hits),
+            )
+
         llm_items, stats = await self._llm_channel(
             contract=contract,
             request=request,
@@ -199,12 +251,14 @@ class ReviewPipeline:
         merged, conflicts = merge_and_cross_check(rule_items, llm_items)
         apply_routing(
             merged,
-            threshold=self._settings.confidence_routing_threshold,
+            threshold=thresholds.confidence_routing_threshold,
             mandatory_high_risk=self._settings.mandatory_human_review_for_high_risk,
         )
 
         # 复核在路由之后跑：它只能加严（把该人工的拉进队列），不能减严
-        judge_outcome = await run_judge(self._judge, merged, stats["retrieved"], self._settings)
+        judge_outcome = await run_judge(
+            self._judge_slot, merged, stats["retrieved"], self._settings
+        )
         judge_counts = apply_judge_verdicts(
             merged,
             judge_outcome.verdicts,
@@ -218,6 +272,7 @@ class ReviewPipeline:
             "rule_hits": len(evaluation.hits),
             "hard_hits": len(evaluation.hard_hits),
             "retrieved": stats["retrieved"],
+            "cases": stats.get("cases", []),
             "channels": stats["channels"],
             "llm_calls": stats["calls"],
             "failed_batches": stats["failed"],
@@ -226,6 +281,8 @@ class ReviewPipeline:
             "judge_counts": judge_counts,
             "inconclusive": evaluation.inconclusive,
             "batch_total": stats["batches"],
+            "injection_hits": injection_hits,
+            "thresholds": thresholds,
         }
 
     # ---------- 规则通道 ----------
@@ -277,7 +334,14 @@ class ReviewPipeline:
         rule_items: list[CandidateFinding],
         focus_rules: list[RedLineRule],
     ) -> tuple[list[CandidateFinding], dict]:
-        stats = {"retrieved": [], "calls": 0, "failed": 0, "batches": 0, "channels": []}
+        stats = {
+            "retrieved": [],
+            "cases": [],
+            "calls": 0,
+            "failed": 0,
+            "batches": 0,
+            "channels": [],
+        }
         if request.rule_only:
             return [], stats
 
@@ -286,16 +350,6 @@ class ReviewPipeline:
         metric_text = metric_summary_for_prompt(metrics)
         hit_lines = describe_rule_hits_for_prompt([_FakeHit(item) for item in rule_items])
         pending_lines = describe_pending_rules(focus_rules, metric_text)
-
-        # 1) 逐批检索，累积去重后的条文池
-        pool: dict[str, RetrievedProvision] = {}
-        retriever = ProvisionRetriever(
-            self._session,
-            self._embedder,
-            self._settings,
-            sparse=self._sparse,
-            reranker=self._reranker,
-        )
         basis_refs = [
             (str(ref.get("law_name")), ref.get("article_no"))
             for rule in focus_rules
@@ -303,29 +357,48 @@ class ReviewPipeline:
             if ref.get("law_name")
         ]
 
-        for batch in batches:
-            query = _retrieval_query(batch, contract.contract_kind, focus_rules)
-            for item in await retriever.search(query, refs=basis_refs, top_k=request.top_k):
-                pool.setdefault(item.provision_id, item)
-
-        stats["channels"] = retriever.channels_used
+        # 1) 逐批检索（并发，每批一个侧会话），累积去重后的条文池
+        pool, case_pool, channels = await self._retrieve_for_batches(
+            batches,
+            contract=contract,
+            focus_rules=focus_rules,
+            basis_refs=basis_refs,
+            top_k=request.top_k,
+        )
+        stats["channels"] = channels
         stats["retrieved"] = list(pool.values())
+        stats["cases"] = list(case_pool.values())
 
-        # 2) 并发调用模型（此阶段不碰数据库，AsyncSession 不是并发安全的）
+        # 2) 词面索引与批次词集预计算：旧实现逐字比对法规名，每批重做一遍分词
+        token_index = await build_token_index(pool.values())
+        batch_tokens = [
+            {token for token in tokens if len(token) >= 2}
+            for tokens in await asyncio.gather(
+                *(atokenize(_batch_text(batch)) for batch in batches)
+            )
+        ]
+
+        # 3) 并发调用模型（此阶段不碰数据库，AsyncSession 不是并发安全的）
+        isolate = self._settings.prompt_isolate_untrusted
+        provision_cap = max(1, self._settings.max_provisions_in_prompt)
+        cases_for_prompt = list(case_pool.values())
         semaphore = asyncio.Semaphore(max(1, self._settings.llm_max_concurrency))
 
         async def invoke(index: int, batch: list[dict]):
-            provisions = _rank_provisions(list(pool.values()), batch)[
-                :_MAX_PROVISIONS_IN_PROMPT
-            ]
+            provisions = _rank_provisions(
+                list(pool.values()), batch_tokens[index - 1], token_index
+            )[:provision_cap]
             system_prompt = build_system_prompt(
                 metric_text=metric_text,
                 provisions=provisions,
                 rule_hits=hit_lines,
                 rule_pending=pending_lines,
                 request=request,
+                cases=cases_for_prompt,
             )
-            user_prompt = build_user_prompt(batch, batch_no=index, batch_total=len(batches))
+            user_prompt = build_user_prompt(
+                batch, batch_no=index, batch_total=len(batches), isolate=isolate
+            )
             async with semaphore:
                 stats["calls"] += 1
                 try:
@@ -338,8 +411,9 @@ class ReviewPipeline:
 
         results = await asyncio.gather(*(invoke(i, b) for i, b in enumerate(batches, 1)))
 
-        # 3) 顺序做引用核验与原文定位
+        # 4) 顺序做引用核验与原文定位
         full_text = contract.content_text or ""
+        valid_case_ids = set(case_pool)
         candidates: list[CandidateFinding] = []
         for draft, batch, error in results:
             if error is not None or draft is None:
@@ -348,10 +422,70 @@ class ReviewPipeline:
                 continue
             for finding in draft.findings:
                 candidates.append(
-                    await self._llm_candidate(finding, batch, segments, full_text)
+                    await self._llm_candidate(
+                        finding, batch, segments, full_text, valid_case_ids=valid_case_ids
+                    )
                 )
 
         return candidates, stats
+
+    async def _retrieve_for_batches(
+        self,
+        batches: list[list[dict]],
+        *,
+        contract: Contract,
+        focus_rules: list[RedLineRule],
+        basis_refs: list[tuple[str, str | None]],
+        top_k: int | None,
+    ) -> tuple[dict[str, RetrievedProvision], dict[str, RetrievedCase], list[str]]:
+        """把逐批检索并发出去。
+
+        串行 for 循环里每批要等 embedding HTTP + ES HTTP + 重排 HTTP，
+        这些都不依赖上一批的结果，排队做就是白付 N 倍延时。
+        并发度沿用 `LLM_MAX_CONCURRENCY`，避免一次审查同时打满连接池与供应商限速。
+        """
+        pool: dict[str, RetrievedProvision] = {}
+        case_pool: dict[str, RetrievedCase] = {}
+        channels: list[str] = []
+        if not batches:
+            return pool, case_pool, channels
+
+        semaphore = asyncio.Semaphore(max(1, self._settings.llm_max_concurrency))
+        factory = self._side_factory
+
+        async def search_one(batch: list[dict]):
+            query = _retrieval_query(batch, contract.contract_kind, focus_rules)
+            # AsyncSession 不是并发安全的，共用一个会直接报错，因此每批一个侧会话
+            async with semaphore, factory() as side_session:
+                retriever = ProvisionRetriever(
+                    side_session,
+                    self._embedder,
+                    self._settings,
+                    sparse=self._sparse,
+                    reranker=self._reranker,
+                )
+                items = await retriever.search(query, refs=basis_refs, top_k=top_k)
+                cases = await retriever.search_cases(query)
+                return items, cases, list(retriever.channels_used)
+
+        results = await asyncio.gather(
+            *(search_one(batch) for batch in batches), return_exceptions=True
+        )
+
+        for index, result in enumerate(results, start=1):
+            if isinstance(result, BaseException):
+                # 一批检索失败不带走整次审查：规则通道仍在，其余批次照常出结论
+                logger.warning("第 %s 批检索失败，本批仅用已有条文池：%s", index, result)
+                continue
+            items, cases, used = result
+            for item in items:
+                pool.setdefault(item.provision_id, item)
+            for case in cases:
+                case_pool.setdefault(case.case_id, case)
+            for kind in used:
+                if kind not in channels:
+                    channels.append(kind)
+        return pool, case_pool, channels
 
     async def _llm_candidate(
         self,
@@ -359,8 +493,12 @@ class ReviewPipeline:
         batch: list[dict],
         segments: list[dict],
         full_text: str,
+        *,
+        valid_case_ids: set[str] | None = None,
     ) -> CandidateFinding:
-        position = locate_excerpt(segments, full_text, finding.excerpt)
+        # 模型回指的 excerpt 来自被转义过的提示词，先换回半角再定位，否则回连不上原文
+        excerpt = restore_untrusted(finding.excerpt)
+        position = locate_excerpt(segments, full_text, excerpt)
         if position is None and finding.segment_index is not None:
             # 退一步：至少归到模型指认的条款上，但标记为未精确定位
             position = _segment_position(segments, finding.segment_index)
@@ -369,6 +507,12 @@ class ReviewPipeline:
             self._session,
             [item.model_dump(mode="json", by_alias=True) for item in finding.citations],
         )
+        # 判例 id 只认本轮检索给出的，与引用的处理口径一致：编造的 id 直接丢
+        case_ids = [
+            case_id
+            for case_id in (finding.similar_case_ids or [])
+            if valid_case_ids is None or case_id in valid_case_ids
+        ]
 
         return CandidateFinding(
             title=finding.title,
@@ -377,7 +521,7 @@ class ReviewPipeline:
             analysis=finding.analysis,
             suggestion=finding.suggestion,
             rewritten_text=finding.rewritten_text,
-            excerpt=finding.excerpt,
+            excerpt=excerpt,
             source=FindingSource.LLM.value,
             cross_check_status=CrossCheckStatus.LLM_ONLY.value,
             confidence=max(0.0, min(1.0, finding.confidence)),
@@ -388,6 +532,7 @@ class ReviewPipeline:
             char_start=(position or {}).get("char_start"),
             char_end=(position or {}).get("char_end"),
             citations=citations,
+            similar_case_ids=case_ids,
             located=position is not None,
         )
 
@@ -431,6 +576,7 @@ class ReviewPipeline:
                 char_start=item.char_start,
                 char_end=item.char_end,
                 citations=item.citations,
+                similar_case_ids=item.similar_case_ids,
                 judge_verdict=item.judge_verdict,
                 human_review_status=item.human_review_status,
                 order_index=index,
@@ -475,6 +621,14 @@ class ReviewPipeline:
         review.retrieved_provisions = [
             item.to_snapshot() for item in outcome["retrieved"]
         ]
+        # 快照补写：JSON 列必须整体重新赋值 SQLAlchemy 才当变化，原地改不会进 UPDATE
+        thresholds: Thresholds | None = outcome.get("thresholds")
+        review.run_options = {
+            **(review.run_options or {}),
+            "retrievedCases": [item.to_snapshot() for item in outcome.get("cases") or []],
+            "injectionSignals": (outcome.get("injection_hits") or [])[:5],
+            "thresholdSnapshot": thresholds.rows() if thresholds else [],
+        }
         review.llm_call_count = outcome["llm_calls"]
         review.failed_batch_count = outcome["failed_batches"]
         review.judge_call_count = outcome["judge_calls"]
@@ -507,13 +661,30 @@ def _retrieval_query(batch: list[dict], contract_kind: str, rules: list[RedLineR
     return " ".join(part for part in parts if part).strip()
 
 
-def _rank_provisions(items: list[RetrievedProvision], batch: list[dict]) -> list[RetrievedProvision]:
-    """把与本轮条款更相关的条文排在前面，避免占位记录挤占提示词窗口。"""
-    keywords = " ".join((segment.get("title") or "") + (segment.get("text") or "")[:200] for segment in batch)
+def _batch_text(batch: list[dict]) -> str:
+    """本轮条款的可匹配文本（标题 + 正文前若干字），供词面重叠计算。"""
+    return " ".join(
+        ((segment.get("title") or "") + " " + (segment.get("text") or "")[:200])
+        for segment in batch
+    )
+
+
+def _rank_provisions(
+    items: list[RetrievedProvision],
+    query_tokens: set[str],
+    token_index: dict[str, set[str]],
+) -> list[RetrievedProvision]:
+    """把与本轮条款更相关的条文排在前面，避免占位记录挤占提示词窗口。
+
+    词面信号用 jieba 词集的重叠率，不再逐字符比对法规名：
+    “民法”与“民法典”在字符集合里会重复计分，分词后才是同一个词。
+    """
 
     def score(item: RetrievedProvision) -> tuple:
-        lexical = sum(1 for token in item.law_name if token in keywords)
-        return (0 if item.is_sample else 1, item.score + 0.01 * lexical)
+        return (
+            0 if item.is_sample else 1,
+            item.score + 0.1 * lexical_overlap(item, query_tokens, token_index),
+        )
 
     return sorted(items, key=score, reverse=True)
 
@@ -549,14 +720,28 @@ def _build_summary(review: ContractReview, items: list[CandidateFinding], outcom
     counts = outcome.get("judge_counts") or {}
     if not review.judge_model:
         parts.append("本次未执行独立结论复核（未配置复核模型），置信度路由仍按原口径生效。")
+    elif review.judge_model == RULE_CHECK_MODEL:
+        parts.append(
+            f"复核模型与主审同源，本次改用确定性规则复核（{RULE_CHECK_MODEL}）："
+            f"已裁定 {counts.get('judged', 0)} 条，其中 {counts.get('disputed', 0)} 条依据不足或双通道冲突。"
+        )
     else:
+        independent = (review.run_options or {}).get("judgeIndependent", True)
         judge_line = (
             f"复核模型 {review.judge_model} 已复核 {counts.get('judged', 0)} 条，"
             f"其中 {counts.get('disputed', 0)} 条被判为不成立或把握不足。"
         )
+        if not independent:
+            judge_line += "注意：它与主审同源，不构成独立信号。"
         if review.judge_failed_count:
             judge_line += f" 另有 {review.judge_failed_count} 批复核调用失败，相关结论标记为未复核。"
         parts.append(judge_line)
+
+    if outcome.get("injection_hits"):
+        parts.append(
+            f"合同正文含 {len(outcome['injection_hits'])} 处疑似提示注入措辞，"
+            "已隔离为数据处理并记录，需人工确认是否为故意规避。"
+        )
 
     channels = outcome.get("channels") or []
     if channels:

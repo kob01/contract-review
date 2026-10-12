@@ -7,6 +7,7 @@ import type {
   RedLineRule,
   ReviewReport,
   ReviewRunRequest,
+  ReviewStatusResponse,
   ReviewSummary,
   RuleDryRunResponse,
   ThresholdSnapshot,
@@ -80,6 +81,12 @@ export const startReview = async (
 export const getReview = async (id: string): Promise<ReviewSummary> =>
   (await http.get<ReviewSummary>(`/reviews/${id}`)).data;
 
+/** 轮询专用：只回状态与时间戳，不拖结论与条文快照。 */
+export const getReviewStatus = async (
+  id: string,
+): Promise<ReviewStatusResponse> =>
+  (await http.get<ReviewStatusResponse>(`/reviews/${id}/status`)).data;
+
 export const getReport = async (id: string): Promise<ReviewReport> =>
   (await http.get<ReviewReport>(`/reviews/${id}/report`)).data;
 
@@ -135,6 +142,25 @@ export const listRules = async (): Promise<RedLineRule[]> =>
 
 export const getThresholds = async (): Promise<ThresholdSnapshot> =>
   (await http.get<ThresholdSnapshot>("/redlines/thresholds")).data;
+
+/**
+ * 批量调整监管阈值口径（法务自助，不改代码不重发版）。
+ * ratio 口径传小数：24% 请传 0.24，后端会按合法区间拒收越界值。
+ */
+export const updateThresholds = async (
+  items: { key: string; value: number; effectiveOn?: string }[],
+  updatedBy = "legal",
+): Promise<ThresholdSnapshot> =>
+  (
+    await http.put<ThresholdSnapshot>("/redlines/thresholds", {
+      items: items.map((item) => ({
+        key: item.key,
+        value: item.value,
+        effective_on: item.effectiveOn,
+      })),
+      updated_by: updatedBy,
+    })
+  ).data;
 
 export const dryRunRules = async (
   text: string,

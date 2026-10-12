@@ -20,6 +20,7 @@ from app.core.logging import get_logger
 from app.models.enums import MetricOperator, RiskLevel
 from app.models.redline import RedLineRule
 from app.services.rules.metrics import Evidence, MetricSet
+from app.services.rules.thresholds import SOURCE_DB, Thresholds
 
 logger = get_logger(__name__)
 
@@ -75,29 +76,46 @@ class RuleEvaluation:
 
 
 class RuleEngine:
-    def __init__(self, rules: Sequence[RedLineRule], app_settings: Settings) -> None:
+    def __init__(
+        self,
+        rules: Sequence[RedLineRule],
+        app_settings: Settings,
+        thresholds: Thresholds | None = None,
+    ) -> None:
         self._rules = list(rules)
         self._settings = app_settings
+        #: 阈值口径优先取库里的生效值（法务自助调整），没传则退回配置默认值
+        self._thresholds = thresholds or Thresholds.from_settings(app_settings)
 
     # ---------- 阈值解析 ----------
+
+    def _source_note(self, key: str) -> str:
+        """口径来源说明：同一个 4 倍 LPR，来自库还是环境变量必须能区分。"""
+        if self._thresholds.sources.get(key) != SOURCE_DB:
+            return ""
+        stamp = self._thresholds.effective_on.get(key) or ""
+        who = self._thresholds.updated_by.get(key) or ""
+        return f"（口径维护：{who}{f' · 生效 {stamp}' if stamp else ''}）"
 
     def resolve_threshold(self, rule: RedLineRule, metrics: MetricSet) -> tuple[float | None, str]:
         """返回 (阈值比率, 人类可读说明)。比率统一为小数口径。"""
         source = rule.threshold_source or "static"
 
         if source == "lpr_four_multiple":
-            value = self._settings.lpr_one_year_rate * self._settings.lpr_multiple
+            lpr = self._thresholds.lpr_one_year_rate
+            multiple = self._thresholds.lpr_multiple
+            value = lpr * multiple
             desc = (
-                f"一年期 LPR {self._settings.lpr_one_year_rate:.2%} 的 "
-                f"{self._settings.lpr_multiple:g} 倍 = {value:.2%}"
+                f"一年期 LPR {lpr:.2%} 的 {multiple:g} 倍 = {value:.2%}"
+                f"{self._source_note('lpr_one_year_rate')}"
             )
             return value, desc
         if source == "regulatory_cost_ceiling":
-            value = self._settings.regulatory_cost_ceiling
-            return value, f"监管综合融资成本红线 {value:.2%}"
+            value = self._thresholds.regulatory_cost_ceiling
+            return value, f"监管综合融资成本红线 {value:.2%}{self._source_note('regulatory_cost_ceiling')}"
         if source == "historical_hard_ceiling":
-            value = self._settings.historical_hard_ceiling
-            return value, f"历史高利贷参考线 {value:.2%}"
+            value = self._thresholds.historical_hard_ceiling
+            return value, f"历史高利贷参考线 {value:.2%}{self._source_note('historical_hard_ceiling')}"
         if source == "nominal_rate_multiple":
             # 用于“真实 IRR 显著高于名义利率”这类背离型判定
             base = metrics.value_of("nominal_annual_rate")

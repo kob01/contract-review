@@ -31,5 +31,8 @@ RUN mkdir -p /app/storage/contracts
 
 EXPOSE 8000
 
-# 镜像内不带 --reload：生产要单进程可预测，开发由本地脚本负责热重载
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# 镜像内不带 --reload：生产要单进程可预测，开发由本地脚本负责热重载。
+# API 进程只做接单/读库（分钟级审查已交给 worker），可以安全开多 worker；
+# 但每个进程一套 DB 连接池，worker 数 x (DB_POOL_SIZE + DB_MAX_OVERFLOW) 不要顶到 max_connections。
+ENV UVICORN_WORKERS=2
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS}"]

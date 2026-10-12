@@ -2,25 +2,41 @@
 
 启动顺序有讲究：必须先建 pgvector 扩展与表，再写入内置红线与法条登记，
 否则规则库为空的服务会把"没有红线"误呈现为"合同全部合规"。
+
+API 进程只负责接单与入队；分钟级审查交给 worker 进程（`python -m app.tasks.worker`）。
+只有当队列不可用而退回进程内执行时，本进程才自己跑巡检循环。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.deps import close_app_clients
 from app.api.router import api_router
 from app.core.config import get_settings
 from app.core.logging import get_logger, setup_logging
-from app.db.session import init_models, session_scope
-from app.services.rag.embeddings import EmbeddingNotConfigured, build_embedding_client
+from app.db.session import dispose_engine, init_models, session_scope
+from app.services.llm.factory import validate_model_slots
+from app.services.rag.embeddings import (
+    EmbeddingNotConfigured,
+    shared_embedder,
+)
 from app.services.rag.ingest import ensure_registry, rebuild_missing_embeddings, sync_sparse_index
-from app.services.rag.rerank import aclose_shared_reranker
-from app.services.rag.sparse import aclose_shared_sparse_index, shared_sparse_index
+from app.services.rag.sparse import shared_sparse_index
 from app.services.rules.seed import ensure_builtin_rules
+from app.services.rules.thresholds import ensure_default_thresholds
+from app.tasks.queue import (
+    close_queue_pool,
+    drain_in_process_tasks,
+    shared_queue_pool,
+)
+from app.tasks.watchdog import watch_zombie_reviews_loop
 
 settings = get_settings()
 logger = get_logger(__name__)
@@ -31,17 +47,36 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     setup_logging()
     logger.info("启动 %s（environment=%s）", settings.app_name, settings.environment)
 
+    # 模型槽位先检查：`JUDGE_SAME_MODEL_POLICY=fail_fast` 时同来路配置直接拒绝启动，
+    # 而不是运行中悄悄自我附和
+    validate_model_slots(settings)
+
+    # 队列先连上：健康检查只 ping 已有连接池，不为此新建连接
+    pool = await shared_queue_pool(settings)
+    if settings.queue_enabled and pool is None:
+        logger.warning(
+            "QUEUE_ENABLED=true 但 Redis（%s）不可达；审查将退回进程内执行，"
+            "本进程重启会丢失在跑的任务",
+            settings.redis_url,
+        )
+
+    watchdog_task: asyncio.Task | None = None
+    if settings.zombie_watchdog_enabled and (not settings.queue_enabled or pool is None):
+        # 队列跑不起来时没有 worker 执行 cron 巡检，必须由本进程兜住僵尸任务
+        watchdog_task = asyncio.create_task(watch_zombie_reviews_loop())
+
     try:
         await init_models()
 
         embedder = None
         try:
-            embedder = build_embedding_client(settings)
+            embedder = shared_embedder(settings)
         except EmbeddingNotConfigured as exc:
             logger.error("向量客户端无法初始化，检索将只走关键词通道：%s", exc)
 
         async with session_scope() as session:
             created_rules = await ensure_builtin_rules(session)
+            created_thresholds = await ensure_default_thresholds(session, settings)
             created_provisions = await ensure_registry(session, embedder=embedder)
             rebuilt = 0
             if embedder is not None and not settings.rag_use_mock_embedding:
@@ -49,8 +84,9 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
                 rebuilt = await rebuild_missing_embeddings(session, embedder)
 
         logger.info(
-            "规则与知识库初始化完成：新增红线 %s 条，新增法条登记 %s 条，补算向量 %s 条",
+            "规则与知识库初始化完成：新增红线 %s 条，新增阈值口径 %s 项，新增法条登记 %s 条，补算向量 %s 条",
             created_rules,
+            created_thresholds,
             created_provisions,
             rebuilt,
         )
@@ -74,9 +110,23 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         # 便于先排查依赖而不是让容器反复崩溃重启
         logger.error("初始化失败，服务将以降级状态启动：%s", exc)
 
+    for warning in settings.audit_warnings():
+        logger.warning("配置口径：%s", warning)
+
     yield
-    await aclose_shared_sparse_index()
-    await aclose_shared_reranker()
+
+    if watchdog_task is not None:
+        watchdog_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await watchdog_task
+    # 进程内回退的任务给一个收尾窗口；超过就放弃，由巡检置 failed
+    await drain_in_process_tasks()
+    await close_queue_pool()
+    # 模型、向量、BM25、重排四类外部连接统一在这里释放
+    await close_app_clients()
+    # 最后归还数据库连接：模块级引擎不随事件循环重启，留着连接只会得到
+    # “Event loop is closed” 与下一轮 lifespan 的隐性失败
+    await dispose_engine()
     logger.info("服务退出")
 
 

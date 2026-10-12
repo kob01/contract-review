@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { apiErrorMessage } from "@/api/client";
-import { contractFileUrl, getContract, getReport, getThresholds } from "@/api";
+import {
+  contractFileUrl,
+  getContract,
+  getReport,
+  getReviewStatus,
+  getThresholds,
+} from "@/api";
 import PdfViewer, { type PdfHighlight } from "@/components/PdfViewer";
 import FindingCard from "@/components/FindingCard";
 import { Card, Empty, ErrorNote } from "@/components/badges";
@@ -26,6 +32,10 @@ export default function ReviewReportPage() {
   const [sourceFilter, setSourceFilter] = useState<
     "all" | "rule" | "llm" | "both"
   >("all");
+  // 排队/执行阶段只看状态：拉完整报告会把报告页自己变成负载源
+  const [live, setLive] = useState<{ status: string; heartbeatAt?: string | null } | null>(
+    null,
+  );
 
   const load = useCallback(async () => {
     try {
@@ -35,6 +45,7 @@ export default function ReviewReportPage() {
       ]);
       setReport(nextReport);
       setContract(nextContract);
+      setLive(null);
       setError(null);
       return nextReport;
     } catch (err) {
@@ -50,15 +61,30 @@ export default function ReviewReportPage() {
       .catch(() => setThresholds(null));
   }, [load]);
 
-  // 审查在后台执行，状态未终结前轮询
+  // 审查在 worker 进程里异步执行：未终结前只轮询轻状态，终态后再拉一次报告
   useEffect(() => {
-    if (!report || !RUNNING.has(report.review.status)) return;
+    const status = live?.status ?? report?.review.status;
+    if (!status || !RUNNING.has(status)) return;
+    let cancelled = false;
     const timer = window.setInterval(async () => {
-      const next = await load();
-      if (next && !RUNNING.has(next.review.status)) window.clearInterval(timer);
+      try {
+        const next = await getReviewStatus(reviewId);
+        if (cancelled) return;
+        if (RUNNING.has(next.status)) {
+          setLive({ status: next.status, heartbeatAt: next.heartbeatAt });
+          return;
+        }
+        window.clearInterval(timer);
+        await load();
+      } catch {
+        // 单次轮询失败不中断：下一轮还会再试，终态靠报告加载时的错提示
+      }
     }, 3000);
-    return () => window.clearInterval(timer);
-  }, [report, load]);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [reviewId, report, live, load]);
 
   useEffect(() => {
     if (contract && contract.fileSuffix !== ".pdf") setView("text");
@@ -104,6 +130,11 @@ export default function ReviewReportPage() {
     return <p className="text-sm text-slate-500">加载中…</p>;
 
   const { review } = report;
+  const shownStatus = live?.status ?? review.status;
+  const judgeModel = review.judgeModel || "";
+  // 同一个模型给自己盖章只是附和：这一点必须写进文书，不能默默过掉
+  const echoChamber =
+    judgeModel !== "" && judgeModel === review.llmModel && !judgeModel.startsWith("rule-check");
 
   return (
     <div className="space-y-4">
@@ -122,6 +153,24 @@ export default function ReviewReportPage() {
           <span className="rounded-lg bg-slate-100 px-2 py-1 text-slate-600">
             模型 {review.llmModel || "—"} · 提示词 {review.promptVersion}
           </span>
+          <span
+            className={`rounded-lg px-2 py-1 ${
+              echoChamber
+                ? "bg-amber-100 text-amber-800"
+                : judgeModel
+                  ? "bg-slate-100 text-slate-600"
+                  : "bg-red-50 text-red-700"
+            }`}
+            title={
+              echoChamber
+                ? "复核模型与主审同源，它的“同意”只是同一模型的第二次表述，不构成独立信号"
+                : judgeModel.startsWith("rule-check")
+                  ? "未叫复核模型，改按硬信号裁定：引用是否已核验、双通道是否冲突、能否回连原文"
+                  : "本次未执行结论复核"
+            }
+          >
+            复核：{echoChamber ? `${judgeModel}（与主审同源）` : judgeModel || "未复核"}
+          </span>
           <span className="rounded-lg bg-slate-100 px-2 py-1 text-slate-600">
             耗时 {review.elapsedSeconds.toFixed(1)}s
           </span>
@@ -135,10 +184,18 @@ export default function ReviewReportPage() {
         </div>
       </header>
 
-      {RUNNING.has(review.status) && (
+      {RUNNING.has(shownStatus) && (
         <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800">
-          审查执行中（{review.status === "pending" ? "排队" : "双通道分析"}
-          ），页面每 3 秒自动刷新。
+          审查已在独立 worker 进程排队/执行（
+          {shownStatus === "pending" ? "排队中" : "双通道分析中"}），页面每 3 秒轮询一次状态。
+          {live?.heartbeatAt && (
+            <span className="ml-1 text-blue-700">
+              最近心跳 {new Date(live.heartbeatAt).toLocaleTimeString()}
+            </span>
+          )}
+          <div className="mt-1 text-xs text-blue-700">
+            API 重启不影响本轮审查；长时间无心跳时巡检会把它判定为失败，届时可重新发起。
+          </div>
         </div>
       )}
 
@@ -459,6 +516,55 @@ export default function ReviewReportPage() {
               </ul>
             )}
           </Card>
+
+          {(report.referenceCases?.length ?? 0) > 0 && (
+            <Card
+              title="同类违规的监管罚单（类比参考，不是法条依据）"
+            >
+              <p className="mb-2 text-xs text-slate-500">
+                这些条目只能回答“同类表述已被罚过”，不能支撑“本条违反某法某条”，
+                因此不进引用清单，也不参与引用核验。
+              </p>
+              <ul className="max-h-64 space-y-2 overflow-auto pr-1 text-xs">
+                {(report.referenceCases ?? []).map((item, index) => (
+                  <li
+                    key={item.caseId ?? index}
+                    className="rounded-lg border border-slate-200 p-2"
+                  >
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium text-slate-800">
+                        {item.orgName || "未标注机构"}
+                      </span>
+                      {item.decidedOn ? (
+                        <span className="text-slate-500">{item.decidedOn}</span>
+                      ) : null}
+                      {item.penaltyBody ? (
+                        <span className="text-slate-500">{item.penaltyBody}</span>
+                      ) : null}
+                      {item.isSample ? (
+                        <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800">
+                          样例数据
+                        </span>
+                      ) : null}
+                    </div>
+                    <p className="mt-1 line-clamp-3 text-slate-600">
+                      {item.summary}
+                    </p>
+                    {item.sourceUrl ? (
+                      <a
+                        className="mt-1 inline-block text-blue-600 hover:underline"
+                        href={item.sourceUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        处罚决定书来源
+                      </a>
+                    ) : null}
+                  </li>
+                ))}
+              </ul>
+            </Card>
+          )}
         </div>
       </div>
     </div>
