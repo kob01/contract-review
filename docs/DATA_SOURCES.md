@@ -41,7 +41,7 @@
    国家金融监督管理总局、最高人民法院发布的司法解释正式文本；
 2. 逐条录入，`content` 必须是官方文本，不得由人工转述或让模型补全；
 3. 填写 `effective_on` / `repealed_on` / `version_label` / `source_url`；
-4. 导入接口会自动向量化（配置真实 Embedding 时）：
+4. 导入接口会在提交后向量化并写入 Qdrant（配置真实 Embedding 时；缺向量只告警、可后续调 reindex 补）：
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/knowledge/provisions \

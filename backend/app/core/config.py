@@ -113,24 +113,30 @@ class Settings(BaseSettings):
     #: ollama = 本地 /api/embed；openai_compatible = 远端 /embeddings；auto = 看 base_url 推断
     embedding_provider: Literal["auto", "openai_compatible", "ollama", "mock"] = "auto"
     embedding_model: str = "qwen3-embedding:8b"
-    #: 稠密向量列维度，改这个值会触发建表阶段的列维对齐（清库 + ALTER TYPE + 重算）。
-    #: qwen3-embedding:8b 原生 4096 维，超出 pgvector HNSW/IVFFlat 索引 2000 维的硬上限，
-    #: 故配合 embedding_truncate 截断到 1024 维（MRL 模型前 1024 维本身即有效向量）
-    embedding_dimensions: int = 1024
-    #: MRL（套娃表示学习）截断：模型原生维度高于 embedding_dimensions 时取前 N 维并重新 L2 归一化。
-    #: 对“原生维度==目标维度”的模型是无操作，故可默认开启；只有 Qwen3-Embedding 这类 MRL 模型
-    #: 才应把目标维度配得低于原生维度，非 MRL 模型不要这样配（会静默失真而非报错）
-    embedding_truncate: bool = True
+    #: 稠密向量维度。qwen3-embedding:8b 原生 4096；改存 Qdrant 后没有 pgvector 2000 维索引上限，
+    #: 直接取原生 4096。改这个值会触发 Qdrant collection 维度不符时重建并重算
+    embedding_dimensions: int = 4096
+    #: MRL（套娃表示学习）截断：仅当要把原生高维截到低维（如迁就 pgvector 2000 维上限）时才开。
+    #: Qdrant 无此上限，故关闭以保留原生 4096；开启则按 embedding_dimensions 截前 N 维并重新归一化
+    embedding_truncate: bool = False
     embedding_base_url: str = "http://localhost:11434"
     embedding_api_key: str = ""
     #: 无密钥时使用确定性哈希向量，保证离线可跑通链路（仅用于开发/测试）
     rag_use_mock_embedding: bool = True
     rag_top_k: int = Field(default=6, ge=1, le=50)
-    #: 相似度下限，低于此分数不进提示词，避免拿不相关法条让模型“硬套”。
-    #: 该阈值随嵌入模型而变（bge-m3 无关句 ~0.37/相关句 ~0.74），换 qwen3 后需按实测分布重调
+    #: 相似度下限，低于此分数不进提示词。Qdrant 的 cosine 分值即相似度（0~1），
+    #: 换模型/维度后需按实测分布重调
     rag_min_similarity: float = Field(default=0.50, ge=0.0, le=1.0)
-    #: pgvector 索引类型：none | ivfflat | hnsw
-    vector_index_type: Literal["none", "ivfflat", "hnsw"] = "hnsw"
+
+    # ---------- 稠密向量库（Qdrant，加速层）----------
+    #: 只存 {主键, 向量, is_active/is_sample/doc_type}；命中后按主键回 Postgres 取权威原文，
+    #: 引用溯源不受影响。不可达时稠密通道降级，其余召回照常
+    qdrant_url: str = "http://localhost:16333"
+    qdrant_collection: str = "contract_provisions"
+    qdrant_cases_collection: str = "contract_enforcement_cases"
+    #: 本地不开鉴权，留空即可
+    qdrant_api_key: str = ""
+    qdrant_timeout_seconds: int = Field(default=30, ge=1, le=600)
     #: 监管罚单通道：默认关。`enforcement_cases` 表现在可能是空的，
     #: 打开后检索会多一路“同类违规已被处罚”的类比召回，并写进提示词
     rag_use_cases: bool = False

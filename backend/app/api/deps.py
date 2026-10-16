@@ -27,9 +27,15 @@ from app.services.rag.sparse import (
     aclose_shared_sparse_index,
     shared_sparse_index,
 )
+from app.services.rag.vectorstore import (
+    QdrantVectorStore,
+    aclose_shared_vectorstore,
+    shared_vectorstore,
+)
 
 __all__ = [
     "ProvisionRetriever",
+    "QdrantVectorStore",
     "Settings",
     "build_retriever",
     "close_app_clients",
@@ -40,6 +46,7 @@ __all__ = [
     "shared_embedder",
     "shared_judge_slot",
     "shared_provider",
+    "shared_vectorstore",
 ]
 
 
@@ -51,6 +58,7 @@ def get_sparse_index() -> SparseSearchIndex | None:
 async def close_search_clients() -> None:
     """应用关闭时释放检索侧的外部连接。"""
     await aclose_shared_sparse_index()
+    await aclose_shared_vectorstore()
     await aclose_shared_reranker()
     await aclose_shared_embedder()
 
@@ -71,4 +79,5 @@ def build_retriever(
         app_settings,
         sparse=shared_sparse_index(app_settings),
         reranker=shared_reranker(app_settings),
+        vector_store=shared_vectorstore(app_settings),
     )

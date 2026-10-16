@@ -6,13 +6,13 @@ embedding 会把"第二十六条"和"第二十七条"视为近义，直接走向
 
 1. 条文直连：规则库 `basis_refs` 指定的（法规名, 条号）必然命中，权重最高；
 2. 关键词：按法规名与内容做 ILIKE 匹配，覆盖"民法典第六百七十条"这类提法；
-3. 向量：pgvector 余弦相似度，负责同义表述与罚单类比。
+3. 向量：Qdrant 稠密相似度，负责同义表述与罚单类比。
 
-向量分支使用 LlamaIndex 的 `BaseRetriever`/`TextNode`/`NodeWithScore` 契约，
-检索执行仍是原生 SQL —— 引用必须能直接回连 `legal_provisions` 主键，
+向量分支使用 LlamaIndex 的 `BaseRetriever`/`TextNode`/`NodeWithScore` 契约；Qdrant 只回 (主键, 分值)，
+权威文本一律按主键回 `legal_provisions` 取——引用必须能直接回连主键，
 把向量库存成另一张影子表会让溯源校验失去意义。
 
-并发口径：只有**不碰 session 的网络动作**（embedding HTTP、ES HTTP）才并发，
+并发口径：只有**不碰 session 的网络动作**（embedding HTTP、ES HTTP、Qdrant HTTP）才并发，
 SQL 一律串行：AsyncSession 不是并发安全的，`asyncio.gather` 里共用一个 session
 会直接报 invalid request，那比串行更贵。
 """
@@ -36,6 +36,7 @@ from app.models.knowledge import EnforcementCase, LegalProvision
 from app.services.rag.embeddings import EmbeddingClient
 from app.services.rag.rerank import RerankClient, RerankUnavailable
 from app.services.rag.sparse import SparseSearchIndex, SparseSearchUnavailable, atokenize
+from app.services.rag.vectorstore import QdrantVectorStore
 
 logger = get_logger(__name__)
 
@@ -152,6 +153,7 @@ class ProvisionRetriever(BaseRetriever):
         *,
         sparse: SparseSearchIndex | None = None,
         reranker: RerankClient | None = None,
+        vector_store: QdrantVectorStore | None = None,
     ) -> None:
         super().__init__()
         self._session = session
@@ -159,6 +161,7 @@ class ProvisionRetriever(BaseRetriever):
         self._settings = app_settings
         self._sparse = sparse
         self._reranker = reranker
+        self._vector_store = vector_store
         #: 本次检索真正参与的通道，降级时不会被误报为“混合检索已启用”
         self.channels_used: list[str] = []
 
@@ -442,27 +445,27 @@ class ProvisionRetriever(BaseRetriever):
     async def _rows_by_vector(
         self, vector: list[float], *, only_active: bool, width: int | None = None
     ) -> list[RetrievedProvision]:
-        """用已算好的查询向量回表。embedding HTTP 已在 `_prefetch_network` 里并发完成。"""
-        if not vector:
+        """Qdrant 稠密召回→按主键回 Postgres 取权威原文。embedding HTTP 已在 `_prefetch_network` 里完成。"""
+        if self._vector_store is None or not vector:
             return []
 
-        distance = LegalProvision.embedding.cosine_distance(vector)
-        stmt = (
-            select(LegalProvision, distance.label("distance"))
-            .where(LegalProvision.embedding.is_not(None))
-            .order_by(distance.asc())
-            .limit(width or self._settings.rag_top_k * 3)
+        hits = await self._vector_store.search(
+            self._vector_store.provisions_collection,
+            vector,
+            limit=width or self._settings.rag_top_k * 3,
+            only_active=only_active,
         )
-        if only_active:
-            stmt = stmt.where(LegalProvision.is_active)
+        if not hits:
+            return []
 
-        result = await self._session.execute(stmt)
+        rows = await self._load_by_ids([provision_id for provision_id, _ in hits])
         items: list[RetrievedProvision] = []
-        for row, raw_distance in result.all():
-            similarity = 1.0 - float(raw_distance)
+        for provision_id, similarity in hits:
             if similarity < self._settings.rag_min_similarity:
                 continue
-            items.append(self._to_retrieved(row, score=similarity))
+            row = rows.get(provision_id)
+            if row is not None:
+                items.append(self._to_retrieved(row, score=similarity))
         return items
 
     async def _match_by_vector(
@@ -507,11 +510,26 @@ class ProvisionRetriever(BaseRetriever):
             try:
                 valid.append(uuid.UUID(raw))
             except (ValueError, TypeError):
-                logger.warning("BM25 返回了非 UUID 主键，已丢弃：%s", raw)
+                logger.warning("向量/索引返回了非 UUID 主键，已丢弃：%s", raw)
         if not valid:
             return {}
 
         result = await self._session.execute(select(LegalProvision).where(LegalProvision.id.in_(valid)))
+        return {str(row.id): row for row in result.scalars().all()}
+
+    async def _load_cases_by_ids(self, case_ids: list[str]) -> dict[str, EnforcementCase]:
+        valid: list[uuid.UUID] = []
+        for raw in case_ids:
+            try:
+                valid.append(uuid.UUID(raw))
+            except (ValueError, TypeError):
+                logger.warning("Qdrant 返回了非 UUID 罚单主键，已丢弃：%s", raw)
+        if not valid:
+            return {}
+
+        result = await self._session.execute(
+            select(EnforcementCase).where(EnforcementCase.id.in_(valid))
+        )
         return {str(row.id): row for row in result.scalars().all()}
 
     # ---------- 辅助 ----------
@@ -570,23 +588,23 @@ class ProvisionRetriever(BaseRetriever):
     async def _cases_by_vector(
         self, vector: list[float], *, only_active: bool, width: int
     ) -> list[RetrievedCase]:
-        distance = EnforcementCase.embedding.cosine_distance(vector)
-        stmt = (
-            select(EnforcementCase, distance.label("distance"))
-            .where(EnforcementCase.embedding.is_not(None))
-            .order_by(distance.asc())
-            .limit(width)
-        )
-        if only_active:
-            stmt = stmt.where(EnforcementCase.is_active)
+        if self._vector_store is None or not vector:
+            return []
 
-        result = await self._session.execute(stmt)
+        hits = await self._vector_store.search(
+            self._vector_store.cases_collection, vector, limit=width, only_active=only_active
+        )
+        if not hits:
+            return []
+
+        rows = await self._load_cases_by_ids([case_id for case_id, _ in hits])
         items: list[RetrievedCase] = []
-        for row, raw_distance in result.all():
-            similarity = 1.0 - float(raw_distance)
+        for case_id, similarity in hits:
             if similarity < self._settings.rag_min_similarity:
                 continue
-            items.append(self._to_case(row, score=similarity))
+            row = rows.get(case_id)
+            if row is not None:
+                items.append(self._to_case(row, score=similarity))
         return items
 
     async def _cases_by_keyword(self, query: str, *, only_active: bool) -> list[RetrievedCase]:

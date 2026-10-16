@@ -11,12 +11,17 @@ from app.services.rag.ingest import (
     PLACEHOLDER_PREFIX,
     ProvisionInput,
     ensure_registry,
-    rebuild_all_embeddings,
-    rebuild_missing_embeddings,
+    index_vectors,
+    sync_vector_store,
     upsert_enforcement_case,
     upsert_provision,
 )
 from app.services.rag.retriever import ProvisionRetriever, RetrievedProvision
+from app.services.rag.vectorstore import (
+    QdrantVectorStore,
+    VectorStoreUnavailable,
+    shared_vectorstore,
+)
 
 __all__ = [
     "PLACEHOLDER_PREFIX",
@@ -26,11 +31,14 @@ __all__ = [
     "OpenAICompatEmbeddings",
     "ProvisionInput",
     "ProvisionRetriever",
+    "QdrantVectorStore",
     "RetrievedProvision",
+    "VectorStoreUnavailable",
     "build_embedding_client",
     "ensure_registry",
-    "rebuild_all_embeddings",
-    "rebuild_missing_embeddings",
+    "index_vectors",
+    "shared_vectorstore",
+    "sync_vector_store",
     "upsert_enforcement_case",
     "upsert_provision",
 ]

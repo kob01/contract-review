@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 本地开发启动脚本（macOS / Linux / Windows Git Bash）
 #   ./scripts/dev.sh                起数据库 + Redis + 后端/worker(后台) + 前端(前台)
-#   ./scripts/dev.sh --db-only      只起 pgvector 数据库与 Redis
+#   ./scripts/dev.sh --db-only      只起数据库、Redis 与 Qdrant
 #   ./scripts/dev.sh --no-frontend  只起数据库 + Redis + 后端（后端日志留在前台）
 # Windows PowerShell 用户请改用 .\scripts\dev.ps1，本文件无法被 powershell 执行。
 set -euo pipefail
@@ -17,13 +17,13 @@ for arg in "$@"; do
   esac
 done
 
-# 在仓库根目录执行 compose，保证能读到根目录的 .env（PGVECTOR_IMAGE / DB_PORT / REDIS_IMAGE）
-echo "==> 启动 PostgreSQL(pgvector) 与 Redis(队列)"
+# 在仓库根目录执行 compose，保证能读到根目录的 .env（PGVECTOR_IMAGE / DB_PORT / REDIS_IMAGE / QDRANT_IMAGE）
+echo "==> 启动 PostgreSQL、Redis(队列) 与 Qdrant(向量)"
 cd "$ROOT"
-docker compose up -d db redis
+docker compose up -d db redis qdrant
 
 if [[ $DB_ONLY -eq 1 ]]; then
-  docker compose ps db redis
+  docker compose ps db redis qdrant
   # 实际端口取自 .env 的 DB_PORT（没配则用 compose 默认的 5433），避免提示信息里写错端口
   PORT="$(grep -E '^[[:space:]]*DB_PORT[[:space:]]*=' "$ROOT/.env" 2>/dev/null | tail -n1 | cut -d= -f2 | tr -dc '0-9' || true)"
   echo "数据库已就绪：localhost:${PORT:-5433} (contract_review/contract_review)"

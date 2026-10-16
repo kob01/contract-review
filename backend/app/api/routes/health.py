@@ -26,6 +26,7 @@ from app.services.llm.factory import (
     describe_llm_backend,
 )
 from app.services.rag.embeddings import describe_embedding_backend
+from app.services.rag.vectorstore import describe_vector_store
 from app.tasks.queue import queue_depth, queue_health, worker_alive
 
 router = APIRouter(tags=["health"])
@@ -92,6 +93,7 @@ async def health(
         llm_reasoning_effort=provider_effort,
         embedding_provider=embedder_name,
         embedding_is_mock=embedder_name == "mock_hashing",
+        dense_store=describe_vector_store(app_settings),
         sparse_enabled=app_settings.rag_sparse_enabled,
         rerank_enabled=app_settings.rag_rerank_enabled,
         cases_enabled=app_settings.rag_use_cases,

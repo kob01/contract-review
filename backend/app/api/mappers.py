@@ -158,7 +158,8 @@ def to_provision_out(row: LegalProvision) -> ProvisionOut:
         source_url=row.source_url,
         is_sample=row.is_sample,
         is_active=row.is_active,
-        has_embedding=row.embedding is not None,
+        # 向量存在 Qdrant；占位登记不入向量，以“是否权威原文”作廉价代理（避免每行回查 Qdrant）
+        has_embedding=not row.is_sample,
     )
 
 
@@ -176,7 +177,7 @@ def to_case_out(row: EnforcementCase) -> EnforcementCaseOut:
         basis_refs=row.basis_refs or [],
         source_url=row.source_url,
         is_sample=row.is_sample,
-        has_embedding=row.embedding is not None,
+        has_embedding=not row.is_sample,
     )
 
 

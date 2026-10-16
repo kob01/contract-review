@@ -45,6 +45,19 @@ services:
       timeout: 3s
       retries: 10
 
+  qdrant:
+    # 稠密向量库（加速层）：只存 {主键, 向量, 过滤 payload}，权威文本仍以 Postgres 为单一数据源
+    # 无法直连 Docker Hub 时把 QDRANT_IMAGE 指向镜像站，与 PGVECTOR_IMAGE 同口径
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.12.4}
+    container_name: contract-review-qdrant
+    restart: unless-stopped
+    ports:
+      # 宿主侧避开可能被占用的 6333；容器内固定 6333(REST) / 6334(gRPC)
+      - "${QDRANT_HTTP_PORT:-16333}:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+
   backend:
     build:
       context: ./backend
@@ -58,6 +71,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
       REDIS_URL: redis://redis:6379/0
+      # 容器内 qdrant 服务名互访走 6333（与宿主 16333 区分）
+      QDRANT_URL: http://qdrant:6333
       # 容器内前端由 nginx 反代，Origin 走浏览器侧 5173/8081
       CORS_ORIGINS: http://localhost:5173,http://localhost:8081
       UPLOAD_DIR: /app/storage/contracts
@@ -69,6 +84,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
     ports:
       - "8000:8000"
     volumes:
@@ -89,12 +106,15 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@db:5432/contract_review
       REDIS_URL: redis://redis:6379/0
+      QDRANT_URL: http://qdrant:6333
       UPLOAD_DIR: /app/storage/contracts
     depends_on:
       db:
         condition: service_healthy
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
       backend:
         condition: service_started
     volumes:
@@ -115,3 +135,4 @@ volumes:
   pgdata:
   contract-storage:
   redisdata:
+  qdrantdata:

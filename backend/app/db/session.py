@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -25,17 +24,7 @@ engine = create_async_engine(
 
 SessionLocal = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
 
-#: pgvector 扩展与向量索引必须在建表前后分别执行
-_HNSW_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS {index_name}
-ON {table_name} USING hnsw (embedding vector_cosine_ops)
-"""
-
-_IVFFLAT_INDEX_SQL = """
-CREATE INDEX IF NOT EXISTS {index_name}
-ON {table_name} USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)
-"""
-
+#: 历史上这两张表带 pgvector 的 embedding 列，迁到 Qdrant 后需清理遗留列
 _VECTOR_TABLES = ("legal_provisions", "enforcement_cases")
 
 #: 开发期新增列的幂等补丁：`create_all` 不会给已存在的表加列，
@@ -65,90 +54,17 @@ async def ensure_added_columns() -> None:
                 await conn.execute(text(sql))
 
 
-#: 读取向量列的实际类型，format_type 会返回形如 vector(1024)
-_VECTOR_COLUMN_TYPE_SQL = """
-SELECT format_type(a.atttypid, a.atttypmod) AS column_type
-FROM pg_attribute a
-JOIN pg_class c ON c.oid = a.attrelid
-JOIN pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relname = :table_name AND n.nspname = 'public' AND a.attname = 'embedding' AND a.attnum > 0
-"""
+async def drop_legacy_embedding_columns() -> None:
+    """清理迁移前遗留的 pgvector `embedding` 列（幂等）。
 
-
-async def ensure_vector_extension() -> None:
-    """确保 vector 扩展存在，否则 jsonb 之外的向量列无法创建。"""
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-
-_VECTOR_DIMENSION_SQLS = (
-    'DROP INDEX IF EXISTS "{index}"',
-    'UPDATE "{table}" SET embedding = NULL WHERE embedding IS NOT NULL',
-    'ALTER TABLE "{table}" ALTER COLUMN embedding TYPE vector({dimensions})',
-)
-
-
-async def align_vector_dimensions() -> int:
-    """把向量列维度对齐到 `EMBEDDING_DIMENSIONS`，返回被改动的表数。
-
-    pgvector 的维度写在列定义里，换嵌入模型（1536 → 1024）不会被 `create_all`
-    自动修正，旧向量也不能直接转型。这里先清空向量（紧接着由启动时的
-    `rebuild_missing_embeddings` 重算），再删索引、改列类型。
+    稠密向量已迁到 Qdrant，Postgres 不再存向量列；旧开发库里可能仍带着
+    `embedding vector(n)` 列，`create_all` 不会删列，这里显式 DROP IF EXISTS。
+    列不存在时是空操作。
     """
-    expected = settings.embedding_dimensions
-    altered = 0
-
     for table_name in _VECTOR_TABLES:
-        async with engine.connect() as conn:
-            current = (
-                await conn.execute(text(_VECTOR_COLUMN_TYPE_SQL), {"table_name": table_name})
-            ).scalar()
-        if current is None:
-            continue
-
-        match = re.search(r"vector\((\d+)\)", str(current))
-        if match and int(match.group(1)) == expected:
-            continue
-
-        logger.warning(
-            "向量列 %s.embedding 当前为 %s，重建为 vector(%s)；旧向量已清空，等待重算",
-            table_name,
-            current,
-            expected,
-        )
-        statements = (
-            sql.format(index=f"ix_{table_name}_embedding", table=table_name, dimensions=expected)
-            for sql in _VECTOR_DIMENSION_SQLS
-        )
         async with engine.begin() as conn:
-            for sql in statements:
-                await conn.execute(text(sql))
-        altered += 1
-
-    return altered
-
-
-async def ensure_vector_indexes() -> None:
-    """按配置创建向量索引；索引类型写错时降级为无索引而不是启动失败。"""
-    if settings.vector_index_type == "none":
-        return
-
-    template = (
-        _HNSW_INDEX_SQL
-        if settings.vector_index_type == "hnsw"
-        else _IVFFLAT_INDEX_SQL
-    )
-
-    for table_name in _VECTOR_TABLES:
-        index_name = f"ix_{table_name}_embedding"
-        try:
-            async with engine.begin() as conn:
-                await conn.execute(
-                    text(template.format(index_name=index_name, table_name=table_name))
-                )
-        except Exception as exc:  # pragma: no cover - 取决于 pgvector 版本
-            logger.warning(
-                "创建向量索引 %s 失败（数据量小时全表扫描仍可用）：%s", index_name, exc
+            await conn.execute(
+                text(f'ALTER TABLE "{table_name}" DROP COLUMN IF EXISTS "embedding"')
             )
 
 
@@ -178,12 +94,10 @@ async def init_models() -> None:
     """开发环境建表。生产环境请改用 Alembic 迁移。"""
     import app.models  # noqa: F401  # 触发模型注册
 
-    await ensure_vector_extension()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await ensure_added_columns()
-    await align_vector_dimensions()
-    await ensure_vector_indexes()
+    await drop_legacy_embedding_columns()
 
 
 async def dispose_engine() -> None:

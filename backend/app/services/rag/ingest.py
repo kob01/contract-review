@@ -23,6 +23,7 @@ from app.models.enums import KnowledgeDocType
 from app.models.knowledge import EnforcementCase, LegalProvision
 from app.services.rag.embeddings import EmbeddingClient
 from app.services.rag.sparse import SparseDoc, SparseSearchIndex
+from app.services.rag.vectorstore import DenseDoc, QdrantVectorStore
 from app.services.rules.builtin_redlines import BUILTIN_RED_LINES
 
 logger = get_logger(__name__)
@@ -82,14 +83,12 @@ def provision_dedup_key(law_name: str, article_no: str, content: str) -> str:
 
 
 async def upsert_provision(
-    session: AsyncSession,
-    payload: ProvisionInput,
-    *,
-    embedder: EmbeddingClient | None = None,
+    session: AsyncSession, payload: ProvisionInput
 ) -> tuple[LegalProvision, bool]:
-    """按（法规名, 条号）写入或更新条文。
+    """按（法规名, 条号）写入或更新条文（只写 Postgres 主表）。
 
     只有 `content` 不是占位前缀开头时才视为权威原文（`is_sample=False`）。
+    向量化与 Qdrant/BM25 同步在路由层提交后另行处理（缺向量只告警、不回滚主表写入）。
     返回 (记录, 是否新建)。
     """
     result = await session.execute(
@@ -101,9 +100,6 @@ async def upsert_provision(
     rows = list(result.scalars().all())
     row = rows[0] if rows else None
     is_placeholder = payload.content.startswith(PLACEHOLDER_PREFIX)
-    embedding = None
-    if embedder is not None and not is_placeholder:
-        embedding = (await embedder.embed_texts([_embedding_text(payload)]))[0]
 
     if row is None:
         row = LegalProvision(
@@ -121,7 +117,6 @@ async def upsert_provision(
             is_sample=is_placeholder,
             is_active=True,
             token_count=len(payload.content),
-            embedding=embedding,
         )
         session.add(row)
         return row, True
@@ -139,19 +134,12 @@ async def upsert_provision(
         row.source_url = payload.source_url or row.source_url
         row.is_sample = is_placeholder
         row.token_count = len(payload.content)
-        if embedding is not None:
-            row.embedding = embedding
     return row, False
-
-
-def _embedding_text(payload: ProvisionInput) -> str:
-    return f"《{payload.law_name}》{payload.article_no or ''} {payload.title or ''}\n{payload.content}"
 
 
 async def ensure_registry(
     session: AsyncSession,
     *,
-    embedder: EmbeddingClient | None = None,
     force: bool = False,
 ) -> int:
     """登记法条占位记录：先补红线引用到的条号，再补法规名级条目。
@@ -177,7 +165,7 @@ async def ensure_registry(
             content=f"{PLACEHOLDER_PREFIX}{note}",
             doc_type=doc_type,
         )
-        _, is_new = await upsert_provision(session, payload, embedder=embedder)
+        _, is_new = await upsert_provision(session, payload)
         if is_new:
             created += 1
 
@@ -201,66 +189,142 @@ async def ensure_registry(
     return created
 
 
-async def rebuild_missing_embeddings(
-    session: AsyncSession, embedder: EmbeddingClient, *, limit: int = 200
-) -> int:
-    """为尚未向量化的权威条文补算向量（占位记录不入库向量）。"""
-    result = await session.execute(
-        select(LegalProvision)
-        .where(
-            LegalProvision.embedding.is_(None),
-            LegalProvision.is_sample.is_(False),
-            LegalProvision.is_active.is_(True),
-        )
-        .limit(limit)
+def to_dense_doc(row: LegalProvision, vector: list[float]) -> DenseDoc:
+    """把一条已算好向量的条文组装成 Qdrant 待写文档（只带过滤用 payload）。"""
+    return DenseDoc(
+        record_id=str(row.id),
+        vector=vector,
+        is_active=row.is_active,
+        is_sample=row.is_sample,
+        doc_type=row.doc_type,
     )
-    rows = list(result.scalars().all())
+
+
+async def index_vectors(
+    session: AsyncSession,
+    store: QdrantVectorStore,
+    embedder: EmbeddingClient,
+    provision_ids: list[str],
+) -> int:
+    """把指定条文向量化并写入 Qdrant（导入/修改后增量同步）。占位记录不入向量。"""
+    if not provision_ids:
+        return 0
+    import uuid as _uuid
+
+    rows = list(
+        (
+            await session.execute(
+                select(LegalProvision).where(
+                    LegalProvision.id.in_([_uuid.UUID(i) for i in provision_ids]),
+                    LegalProvision.is_sample.is_(False),
+                    LegalProvision.is_active.is_(True),
+                )
+            )
+        ).scalars().all()
+    )
     if not rows:
         return 0
-
-    texts = [_embedding_text_row(row) for row in rows]
-    vectors = await embedder.embed_texts(texts)
-    for row, vector in zip(rows, vectors, strict=True):
-        row.embedding = vector
-    await session.commit()
-    logger.info("补算条文向量 %s 条", len(rows))
-    return len(rows)
+    vectors = await embedder.embed_texts([_embedding_text_row(row) for row in rows])
+    docs = [to_dense_doc(row, vector) for row, vector in zip(rows, vectors, strict=True)]
+    return await store.upsert(store.provisions_collection, docs)
 
 
-async def rebuild_all_embeddings(
-    session: AsyncSession, embedder: EmbeddingClient, *, batch: int = 200
+async def sync_vector_store(
+    session: AsyncSession,
+    store: QdrantVectorStore,
+    embedder: EmbeddingClient,
+    *,
+    batch: int = 64,
 ) -> int:
-    """全量重算权威条文向量，覆盖旧向量，分批直到没有剩余。
+    """全量重算并覆盖权威条文向量（换模型/换维或首次从 pgvector 迁移时用）。
 
-    与 `rebuild_missing_embeddings` 的关键区别：后者只补 `embedding IS NULL` 的行，
-    而**同维度换嵌入模型**（如 bge-m3 → qwen3-embedding，都是 1024 维）时旧的异源向量
-    非 NULL 会被跳过，新旧向量混在同一空间、相似度失真却不报错。换模型（即便维度不变）
-    必须走本函数强制全量重算，不能只补 NULL。
+    只处理 active 且非占位的条文（占位不入向量），分批 embed→upsert。调用前应已由
+    `ensure_collection` 保证集合按当前维度就绪（维度不符会在那里被重建清空）。
     """
     total = 0
     while True:
-        result = await session.execute(
-            select(LegalProvision)
-            .where(
-                LegalProvision.is_sample.is_(False),
-                LegalProvision.is_active.is_(True),
-            )
-            .order_by(LegalProvision.id)
-            .limit(batch)
-            .offset(total)
+        rows = list(
+            (
+                await session.execute(
+                    select(LegalProvision)
+                    .where(
+                        LegalProvision.is_sample.is_(False),
+                        LegalProvision.is_active.is_(True),
+                    )
+                    .order_by(LegalProvision.id)
+                    .limit(batch)
+                    .offset(total)
+                )
+            ).scalars().all()
         )
-        rows = list(result.scalars().all())
         if not rows:
             break
-        texts = [_embedding_text_row(row) for row in rows]
-        vectors = await embedder.embed_texts(texts)
-        for row, vector in zip(rows, vectors, strict=True):
-            row.embedding = vector
-        await session.commit()
+        vectors = await embedder.embed_texts([_embedding_text_row(row) for row in rows])
+        docs = [to_dense_doc(row, vector) for row, vector in zip(rows, vectors, strict=True)]
+        await store.upsert(store.provisions_collection, docs)
         total += len(rows)
         if len(rows) < batch:
             break
-    logger.info("全量重算条文向量 %s 条", total)
+    logger.info("Qdrant 条文向量同步完成：%s 条", total)
+    return total
+
+
+def to_case_dense_doc(row: EnforcementCase, vector: list[float]) -> DenseDoc:
+    return DenseDoc(
+        record_id=str(row.id),
+        vector=vector,
+        is_active=row.is_active,
+        is_sample=row.is_sample,
+        doc_type="enforcement_case",
+    )
+
+
+def _case_embedding_text(row: EnforcementCase) -> str:
+    return f"{row.org_name} {row.summary} {row.penalty_content} {' '.join(row.violation_types or [])}"
+
+
+async def index_case_vector(
+    session: AsyncSession, store: QdrantVectorStore, embedder: EmbeddingClient, case_id: str
+) -> int:
+    """把一条罚单向量化写入 Qdrant（非占位、active 才入）。"""
+    import uuid as _uuid
+
+    row = await session.get(EnforcementCase, _uuid.UUID(case_id))
+    if row is None or row.is_sample or not row.is_active:
+        return 0
+    vector = (await embedder.embed_texts([_case_embedding_text(row)]))[0]
+    return await store.upsert(store.cases_collection, [to_case_dense_doc(row, vector)])
+
+
+async def sync_cases_vector_store(
+    session: AsyncSession, store: QdrantVectorStore, embedder: EmbeddingClient, *, batch: int = 64
+) -> int:
+    """全量重算监管罚单向量（罚单表默认为空，通道关闭时不调用）。"""
+    total = 0
+    while True:
+        rows = list(
+            (
+                await session.execute(
+                    select(EnforcementCase)
+                    .where(
+                        EnforcementCase.is_sample.is_(False),
+                        EnforcementCase.is_active.is_(True),
+                    )
+                    .order_by(EnforcementCase.id)
+                    .limit(batch)
+                    .offset(total)
+                )
+            ).scalars().all()
+        )
+        if not rows:
+            break
+        vectors = await embedder.embed_texts([_case_embedding_text(row) for row in rows])
+        docs = [to_case_dense_doc(row, vector) for row, vector in zip(rows, vectors, strict=True)]
+        await store.upsert(store.cases_collection, docs)
+        total += len(rows)
+        if len(rows) < batch:
+            break
+    logger.info("Qdrant 罚单向量同步完成：%s 条", total)
     return total
 
 
@@ -324,7 +388,6 @@ async def upsert_enforcement_case(
     basis_refs: list[dict] | None = None,
     source_url: str | None = None,
     is_sample: bool = False,
-    embedder: EmbeddingClient | None = None,
 ) -> EnforcementCase:
     """写入监管罚单，按（机构, 案号）幂等。"""
     stmt = select(EnforcementCase).where(
@@ -345,10 +408,6 @@ async def upsert_enforcement_case(
     row.basis_refs = basis_refs or []
     row.source_url = source_url
     row.is_sample = is_sample
-
-    if embedder is not None and row.embedding is None and not is_sample:
-        text = f"{org_name} {summary} {penalty_content} {' '.join(violation_types or [])}"
-        row.embedding = (await embedder.embed_texts([text]))[0]
 
     await session.commit()
     return row

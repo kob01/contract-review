@@ -133,7 +133,6 @@ async def fetch_penalty_notices(
                     basis_refs=detail.get("basis_refs", []),
                     source_url=detail.get("source_url"),
                     is_sample=False,
-                    embedder=embedder,
                 )
             except Exception as exc:  # 单条失败不影响整批
                 skipped += 1

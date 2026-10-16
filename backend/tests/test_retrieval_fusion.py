@@ -1,7 +1,7 @@
 """RRF 融合、jieba 分词与词面信号。
 
 融合逻辑决定了"哪条法条进提示词"，一旦写错会稳定地把不相关条文喂给模型，
-所以只测纯函数，不依赖 ES 与 pgvector。
+所以只测纯函数，不依赖 ES 与向量库。
 """
 
 from __future__ import annotations

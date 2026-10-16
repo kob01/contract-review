@@ -43,7 +43,7 @@ class EmbeddingClient(Protocol):
 
 
 def _check_dimensions(vectors: list[list[float]], expected: int, source: str) -> list[list[float]]:
-    """维度不一致时直接报错，不能让错维向量写进 pgvector 列。"""
+    """维度不一致时直接报错，不能让错维向量写进向量库（Qdrant 集合维度固定）。"""
     for vector in vectors:
         if len(vector) != expected:
             raise EmbeddingDimensionMismatch(

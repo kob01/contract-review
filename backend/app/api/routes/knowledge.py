@@ -35,14 +35,16 @@ from app.services.rag.embeddings import (
 from app.services.rag.ingest import (
     PLACEHOLDER_PREFIX,
     ProvisionInput,
+    index_case_vector,
     index_provisions,
-    rebuild_all_embeddings,
-    rebuild_missing_embeddings,
+    index_vectors,
     sync_sparse_index,
+    sync_vector_store,
     upsert_enforcement_case,
     upsert_provision,
 )
 from app.services.rag.sparse import shared_sparse_index
+from app.services.rag.vectorstore import shared_vectorstore
 
 router = APIRouter(prefix="/knowledge", tags=["knowledge"])
 logger = get_logger(__name__)
@@ -99,12 +101,6 @@ async def import_provision(
             detail=f"content 不能以 {PLACEHOLDER_PREFIX} 开头，那是占位记录的前缀",
         )
 
-    embedder = None
-    try:
-        embedder = _embedder(app_settings)
-    except Exception as exc:  # 向量不可用时仍允许导入原文，检索退回其余通道
-        logger.warning("向量客户端不可用，条文将暂不向量化：%s", exc)
-
     row, _ = await upsert_provision(
         session,
         ProvisionInput(
@@ -120,17 +116,23 @@ async def import_provision(
             version_label=payload.version_label,
             source_url=payload.source_url,
         ),
-        embedder=embedder,
     )
     await session.commit()
 
-    # 同步 BM25 索引：失败不回滚已落库的条文，但必须说出口，否则新条文只在向量命里
+    # 同步 BM25 与 Qdrant 向量：都在提交后做，失败不回滚已落库的条文，缺的调 reindex 补
     sparse = shared_sparse_index(app_settings)
     if sparse is not None:
         try:
             await index_provisions(session, sparse, [str(row.id)])
         except Exception as exc:
             logger.warning("条文已入库但未同步到 BM25 索引（可调 POST /knowledge/reindex 补）：%s", exc)
+
+    try:
+        await index_vectors(
+            session, shared_vectorstore(app_settings), _embedder(app_settings), [str(row.id)]
+        )
+    except Exception as exc:
+        logger.warning("条文已入库但未写入 Qdrant 向量（可调 POST /knowledge/reindex 补）：%s", exc)
 
     return to_provision_out(row)
 
@@ -150,6 +152,9 @@ async def delete_provision(
     sparse = shared_sparse_index(app_settings)
     if sparse is not None:
         await sparse.delete(str(provision_id))
+
+    store = shared_vectorstore(app_settings)
+    await store.delete(store.provisions_collection, str(provision_id))
 
 
 @router.get("/search", response_model=ProvisionSearchResponse)
@@ -199,30 +204,22 @@ async def search_provisions(
 
 @router.post("/reindex", response_model=ReindexResult)
 async def reindex_knowledge(
-    full: bool = Query(
-        False,
-        description="true = 全量重算所有权威条文向量（换嵌入模型时用）；false = 只补缺失向量",
-    ),
     session: AsyncSession = Depends(get_db),
     app_settings: Settings = Depends(get_settings),
 ) -> ReindexResult:
-    """重建检索侧数据：补算/全量重算向量 + 全量同步 BM25 索引。
+    """重建检索侧数据：向 Qdrant 全量重算条文向量 + 全量同步 BM25 索引。
 
-    换嵌入模型、调整分词口径、ES 索引被清过之后都该调一次。**换嵌入模型必须带
-    `full=true`**：同维度换模型时旧的异源向量非 NULL，只补缺失会漏掉它们，导致
-    新旧向量混空间、相似度失真。向量与索引分开返回，通道不可用时写进 message，
-    而不是伪装成“重建成功”。
+    换嵌入模型、换维度、ES 索引被清过之后都该调一次。Qdrant 侧维度不符会先重建集合
+    再重算（旧维度向量属于另一个空间，留着只会静默失真）。向量与索引分开返回，
+    通道不可用时写进 message，而不是伪装成“重建成功”。
     """
     notes: list[str] = []
 
     embeddings_rebuilt = 0
     try:
-        embedder = _embedder(app_settings)
-        embeddings_rebuilt = (
-            await rebuild_all_embeddings(session, embedder)
-            if full
-            else await rebuild_missing_embeddings(session, embedder)
-        )
+        store = shared_vectorstore(app_settings)
+        await store.ensure_collection(store.provisions_collection)
+        embeddings_rebuilt = await sync_vector_store(session, store, _embedder(app_settings))
     except Exception as exc:
         notes.append(f"向量重建未完成：{exc}")
 
@@ -272,12 +269,6 @@ async def import_case(
     session: AsyncSession = Depends(get_db),
     app_settings: Settings = Depends(get_settings),
 ) -> EnforcementCaseOut:
-    embedder = None
-    try:
-        embedder = _embedder(app_settings)
-    except Exception:  # pragma: no cover - 向量不可用时仍可入库
-        embedder = None
-
     row = await upsert_enforcement_case(
         session,
         org_name=payload.org_name,
@@ -290,8 +281,15 @@ async def import_case(
         violation_types=payload.violation_types,
         basis_refs=payload.basis_refs,
         source_url=payload.source_url,
-        embedder=embedder,
     )
+
+    try:
+        await index_case_vector(
+            session, shared_vectorstore(app_settings), _embedder(app_settings), str(row.id)
+        )
+    except Exception as exc:  # pragma: no cover - 向量不可用时仍可入库
+        logger.warning("罚单已入库但未写入 Qdrant 向量：%s", exc)
+
     return to_case_out(row)
 
 

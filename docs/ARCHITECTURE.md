@@ -19,8 +19,8 @@ contracts                 一份合同：全文 + segments(条款切片, 带 cha
   │
 red_line_rules            合规红线（数据驱动的规则 DSL；内置集只负责首次登记）
 regulatory_thresholds     监管阈值口径（key + 值 + 生效日 + 维护人）——法务可自助调整
-legal_provisions          法条主表（一条一文 + pgvector 向量列）——引用的唯一可信来源
-enforcement_cases         监管罚单（类比论证素材 + 向量列，默认不参与检索：RAG_USE_CASES）
+legal_provisions          法条主表（一条一文，引用的唯一可信来源）——稠密向量另存 Qdrant 加速层
+enforcement_cases         监管罚单（类比论证素材，默认不参与检索：RAG_USE_CASES）——向量同样存 Qdrant
 knowledge_ingest_runs     采集/入库审计记录
 ```
 
@@ -72,8 +72,8 @@ knowledge_ingest_runs     采集/入库审计记录
 
 1. **条文直连**：规则 `basis_refs` 指定的（法规名, 条号）必然命中，融合时拿封顶分，
    且**不参与重排剔除**——它是规则自带的引用基础，不是相似度发现；
-2. **向量**：pgvector 余弦距离（`1 - distance ≥ RAG_MIN_SIMILARITY` 才入选），
-   默认后端是本地 Ollama 的 qwen3-embedding:8b（原生 4096 维，按 MRL 截断到 1024 维 + HNSW/cosine）；
+2. **向量**：Qdrant 稠密余弦相似度（`score ≥ RAG_MIN_SIMILARITY` 才入选），
+   后端是本地 Ollama 的 qwen3-embedding:8b（原生 4096 维，cosine）；Qdrant 只回 (主键, 分值)，原文回 Postgres 取；
 3. **BM25**：Elasticsearch。分词在应用侧用 jieba 完成，把切好的词写进 `whitespace`
    分析器字段：目标集群通常装不上 analysis 插件，而写入与查询共用同一套词典更可控；
 4. **关键词兜底**：法规名与条文内容 ILIKE + 条号精确匹配，ES 不可达时顶上。
@@ -85,9 +85,9 @@ knowledge_ingest_runs     采集/入库审计记录
 重排解决"谁真的相关"。低于 `RAG_RERANK_MIN_SCORE` 的候选直接剔除，这一步拦下的正是
 "靠一个共享词命中"的噪声——本机实测相关条文 ~0.99，占位记录与不相关条文 ≤0.08。
 
-检索器实现为 LlamaIndex `BaseRetriever` 子类，返回 `NodeWithScore(TextNode)`，
-但**相似度计算留在原生 SQL**：引用需要直接回连 `legal_provisions` 主键，
-另建一张影子向量表会让溯源校验失去意义。ES 只当"名次来源"，命中的 id 一律回主表取原文。
+检索器实现为 LlamaIndex `BaseRetriever` 子类，返回 `NodeWithScore(TextNode)`。
+**向量库只当加速层**：Qdrant / ES 都只回命中主键，权威文本一律回 `legal_provisions` 取——
+引用需要直接回连主键，把向量库存成另一张影子表会让溯源校验失去意义。
 
 每次审查都会落 `retrieval_channels`（本次真正参与的通道），因此降级是可事后审计的事实，
 而不是只写在日志里的一句话。
@@ -256,7 +256,7 @@ LLM（主审/复核）、embedding、ES、TEI 四类客户端都按“配置指�
 
 - 鉴权与多租户（`contracts.owner_id` 已预留）：阈值与规则页的“谁能改”目前无约束；
 - Alembic 迁移（开发期用 `create_all` + `session.py` 里的启动补丁：
-  `_ADDED_COLUMNS` 补新列、`align_vector_dimensions()` 对齐向量列维度）；
+  `_ADDED_COLUMNS` 补新列、`drop_legacy_embedding_columns()` 清理迁 Qdrant 前遗留的向量列）；
 - 规则变更审计日志（`red_line_rules` 的 PATCH 与 `regulatory_thresholds` 的 PUT 现在只记 logger，
   未落审计表；合规场景下一句“这个 24% 是谁改的”应该能回答）；
 - 罚单类比通道已实现但默认关（`RAG_USE_CASES`）：BM25 索引只覆盖条文，

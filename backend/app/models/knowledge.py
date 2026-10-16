@@ -4,7 +4,7 @@
 - `LegalProvision`：法条级切片（一条一文），是"溯源引用"的唯一可信来源；
 - `EnforcementCase`：监管处罚案例（罚单），用于"同类违规已被处罚"的类比论证。
 
-二者都带 pgvector 向量列，支持语义检索；同时保留 law_name/article_no 的
+二者都支持语义检索（稠密向量存于 Qdrant 加速层，向量列不在本表）；同时保留 law_name/article_no 的
 精确匹配能力，因为"第几条"这类判断靠向量相似度并不可靠。
 """
 
@@ -12,11 +12,9 @@ from __future__ import annotations
 
 from datetime import date
 
-from pgvector.sqlalchemy import Vector
 from sqlalchemy import Boolean, Date, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.config import settings
 from app.db.base import Base, JSONType, TimestampMixin, UUIDPrimaryKeyMixin
 from app.models.enums import KnowledgeDocType
 
@@ -58,7 +56,6 @@ class LegalProvision(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     chunk_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     token_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     extra: Mapped[dict] = mapped_column(JSONType, default=dict, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embedding_dimensions))
 
     def is_repealed(self, on: date | None = None) -> bool:
         if self.repealed_on is None:
@@ -89,7 +86,6 @@ class EnforcementCase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     is_sample: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
-    embedding: Mapped[list[float] | None] = mapped_column(Vector(settings.embedding_dimensions))
 
     @property
     def display_label(self) -> str:

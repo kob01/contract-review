@@ -1,6 +1,6 @@
 """应用入口。
 
-启动顺序有讲究：必须先建 pgvector 扩展与表，再写入内置红线与法条登记，
+启动顺序有讲究：必须先建表并让 Qdrant 集合就绪，再写入内置红线与法条登记，
 否则规则库为空的服务会把"没有红线"误呈现为"合同全部合规"。
 
 API 进程只负责接单与入队；分钟级审查交给 worker 进程（`python -m app.tasks.worker`）。
@@ -27,8 +27,9 @@ from app.services.rag.embeddings import (
     EmbeddingNotConfigured,
     shared_embedder,
 )
-from app.services.rag.ingest import ensure_registry, rebuild_missing_embeddings, sync_sparse_index
+from app.services.rag.ingest import ensure_registry, sync_sparse_index, sync_vector_store
 from app.services.rag.sparse import shared_sparse_index
+from app.services.rag.vectorstore import shared_vectorstore
 from app.services.rules.seed import ensure_builtin_rules
 from app.services.rules.thresholds import ensure_default_thresholds
 from app.tasks.queue import (
@@ -77,18 +78,28 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         async with session_scope() as session:
             created_rules = await ensure_builtin_rules(session)
             created_thresholds = await ensure_default_thresholds(session, settings)
-            created_provisions = await ensure_registry(session, embedder=embedder)
-            rebuilt = 0
-            if embedder is not None and not settings.rag_use_mock_embedding:
-                # 向量列对齐或新导入原文都可能导致空洞，启动时补一轮
-                rebuilt = await rebuild_missing_embeddings(session, embedder)
+            created_provisions = await ensure_registry(session)
+
+        # 稠密向量已迁 Qdrant：先确保集合按当前维度就绪（不符会重建清空），再全量重算。
+        # mock 向量下不 populate（旧行为一致，且哈希向量无语义）；Qdrant 不可达只降级不阻塞启动
+        synced_vectors = 0
+        store = shared_vectorstore(settings)
+        if embedder is not None and not settings.rag_use_mock_embedding:
+            try:
+                await store.ensure_collection(store.provisions_collection)
+                if settings.rag_use_cases:
+                    await store.ensure_collection(store.cases_collection)
+                async with session_scope() as session:
+                    synced_vectors = await sync_vector_store(session, store, embedder)
+            except Exception as exc:
+                logger.warning("Qdrant 向量同步未完成，稠密检索暂降级：%s", exc)
 
         logger.info(
-            "规则与知识库初始化完成：新增红线 %s 条，新增阈值口径 %s 项，新增法条登记 %s 条，补算向量 %s 条",
+            "规则与知识库初始化完成：新增红线 %s 条，新增阈值口径 %s 项，新增法条登记 %s 条，同步向量 %s 条",
             created_rules,
             created_thresholds,
             created_provisions,
-            rebuilt,
+            synced_vectors,
         )
         if settings.rag_use_mock_embedding:
             logger.warning(

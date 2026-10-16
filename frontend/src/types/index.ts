@@ -383,6 +383,8 @@ export interface HealthResponse {
   judgeIndependent: boolean;
   embeddingProvider: string;
   embeddingIsMock: boolean;
+  /** 稠密向量后端（qdrant）；权威文本仍以 Postgres 为单一数据源 */
+  denseStore?: string;
   sparseEnabled?: boolean;
   rerankEnabled?: boolean;
   casesEnabled?: boolean;

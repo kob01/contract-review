@@ -29,7 +29,7 @@ cp .env.example .env            # 默认无需任何密钥即可跑通全链路�
 拉起依赖服务与完整后端（三个进程，缺一不可）：
 
 ```bash
-docker compose up -d db redis   # PostgreSQL 16 + pgvector，Redis 作任务队列
+docker compose up -d db redis qdrant   # PostgreSQL 16、Redis 队列、Qdrant 向量库
 cd backend && uv run uvicorn app.main:app --reload --port 8000   # API：接单与读库
 cd backend && uv run python -m app.tasks.worker                 # worker：跑审查
 cd frontend && npm run dev
@@ -42,21 +42,21 @@ cd frontend && npm run dev
 
 访问 <http://localhost:5173>，上传 `samples/consumer-loan-demo.txt` 即可看到完整审查报告。
 
-> Docker Hub 不可直连时，在 `.env` 里设 `PGVECTOR_IMAGE=docker.m.daocloud.io/pgvector/pgvector:pg16`；
+> Docker Hub 不可直连时，在 `.env` 里设 `PGVECTOR_IMAGE=docker.m.daocloud.io/pgvector/pgvector:pg16`、`QDRANT_IMAGE=docker.m.daocloud.io/qdrant/qdrant:v1.12.4`；
 > 数据库默认映射宿主机 **5433**（容器内 Postgres 固定监听 5432，只能改宿主机侧端口）。
 > 改端口时下列四处必须一致，否则后端会连到旧端口：`docker-compose.yml` 的 `${DB_PORT:-5433}` 默认值、
 > `.env` 的 `DB_PORT`、`.env` 的 `DATABASE_URL`、`backend/app/core/config.py` 的 `database_url` 默认值。
 
 ## 技术栈
 
-| 层    | 选型                                                                                                                                  |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                                         |
-| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                                             |
-| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                                            |
-| 检索  | **pgvector**（Ollama qwen3-embedding:8b，MRL 截断到 1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排 |
-| 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 + 回音壁防护                 |
-| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、阈值口径、结论、复核任务同源一库）                                                        |
+| 层    | 选型                                                                                                                                   |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                                          |
+| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                                              |
+| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                                             |
+| 检索  | **Qdrant** 稠密向量（Ollama qwen3-embedding:8b，原生 4096 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排 |
+| 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 + 回音壁防护                  |
+| 数据  | PostgreSQL 16（法条、罚单、红线、阈值口径、结论、复核任务同源一库）+ **Qdrant** 存稠密向量（加速层，命中回连主键）                     |
 
 ## 双通道审查流程
 
@@ -69,7 +69,7 @@ cd frontend && npm run dev
   → 确定性指标抽取（日/月/年化利率、综合成本、IRR、本金预扣比例、霸王条款特征）
   → 阅读阈值口径（regulatory_thresholds 表 → 没记录才退环境变量）
   → 规则引擎判定硬红线（>24%、>4×LPR、砍头息、最终解释权、放弃抗辩…）
-  → RAG 逐批并发检索（条文直连 + pgvector 向量 + ES/jieba BM25 + ILIKE 兜底，四路 RRF 融合；
+  → RAG 逐批并发检索（条文直连 + Qdrant 向量 + ES/jieba BM25 + ILIKE 兜底，四路 RRF 融合；
      可选监管罚单类比通道 RAG_USE_CASES）
   → cross-encoder 重排（bge-reranker-v2-m3，低相关候选剔除）
   → LLM 定性判断（合同原文用分隔标签隔离为数据；只允许引用检索清单内的条文，数值不允许自己算）

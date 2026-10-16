@@ -33,6 +33,8 @@ class HealthResponse(CamelModel):
     embedding_provider: str
     #: mock 向量时检索结果不具语义相关性，必须在响应里显式暴露
     embedding_is_mock: bool
+    #: 稠密向量后端（qdrant）；权威文本仍以 Postgres 为单一数据源
+    dense_store: str = "qdrant"
     #: 稀疏/重排通道的配置口径；ES 与 TEI 是否真连通以审查记录的
     #: `retrievalChannels` 为准（那里是本次实际参与通道，不是配置值）
     sparse_enabled: bool = False
