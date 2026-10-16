@@ -1,7 +1,8 @@
 """向量化客户端。
 
 三种实现：
-- `OllamaEmbeddings`：本地 Ollama 原生 `/api/embed`，默认对接 bge-m3（1024 维）；
+- `OllamaEmbeddings`：本地 Ollama 原生 `/api/embed`，对接 qwen3-embedding:8b 等模型
+  （原生 4096 维；MRL 模型可按 `EMBEDDING_TRUNCATE` 截断到 `EMBEDDING_DIMENSIONS`）；
 - `OpenAICompatEmbeddings`：走 OpenAI 兼容 `/embeddings` 接口，可对接
   OpenAI、通义（text-embedding-v3）、vLLM 等；
 - `HashingEmbeddings`：确定性哈希向量，离线开发与单元测试专用。
@@ -47,9 +48,32 @@ def _check_dimensions(vectors: list[list[float]], expected: int, source: str) ->
         if len(vector) != expected:
             raise EmbeddingDimensionMismatch(
                 f"{source} 返回 {len(vector)} 维向量，与 EMBEDDING_DIMENSIONS={expected} 不一致；"
-                "请对齐模型与维度（bge-m3=1024，text-embedding-3-small=1536）并重建向量列"
+                "请对齐模型与维度（qwen3-embedding:8b 原生 4096，可开 EMBEDDING_TRUNCATE 截断；"
+                "bge-m3=1024，text-embedding-3-small=1536）并重建向量列"
             )
     return vectors
+
+
+def _mrl_truncate(vectors: list[list[float]], target: int, source: str) -> list[list[float]]:
+    """把高于 `target` 维的向量按 MRL（套娃表示学习）截断到前 `target` 维并重新 L2 归一化。
+
+    Qwen3-Embedding 等 MRL 模型的前 N 维本身就是有效向量（业界做法即直接取前 1024 维），
+    因此可安全截断以适配 pgvector 索引 2000 维的硬上限。仅当 `EMBEDDING_TRUNCATE=true` 时调用；
+    非 MRL 模型不要开，截断会静默破坏语义。维度不足 `target` 无法补齐，直接报错。
+    """
+    truncated: list[list[float]] = []
+    for vector in vectors:
+        if len(vector) < target:
+            raise EmbeddingDimensionMismatch(
+                f"{source} 返回 {len(vector)} 维向量，低于 EMBEDDING_DIMENSIONS={target}，无法截断补齐"
+            )
+        if len(vector) == target:
+            truncated.append(vector)
+            continue
+        head = vector[:target]
+        norm = math.sqrt(sum(value * value for value in head)) or 1.0
+        truncated.append([value / norm for value in head])
+    return truncated
 
 
 class OllamaEmbeddings:
@@ -57,11 +81,12 @@ class OllamaEmbeddings:
 
     name = "ollama"
 
-    def __init__(self, *, base_url: str, model: str, dimensions: int) -> None:
+    def __init__(self, *, base_url: str, model: str, dimensions: int, truncate: bool = False) -> None:
         import httpx
 
         self.model = model
         self.dimensions = dimensions
+        self.truncate = truncate
         self._base = _normalize_ollama_base(base_url)
         self._client = httpx.AsyncClient(base_url=self._base, timeout=120)
 
@@ -84,7 +109,10 @@ class OllamaEmbeddings:
                     f"Ollama /api/embed 返回异常：期望 {len(chunk)} 条向量，实际 {embeddings!r:.200}"
                 )
             vectors.extend([float(value) for value in item] for item in embeddings)
-        return _check_dimensions(vectors, self.dimensions, f"ollama:{self.model}")
+        source = f"ollama:{self.model}"
+        if self.truncate:
+            vectors = _mrl_truncate(vectors, self.dimensions, source)
+        return _check_dimensions(vectors, self.dimensions, source)
 
     async def embed_query(self, text: str) -> list[float]:
         (vector,) = await self.embed_texts([text])
@@ -105,11 +133,14 @@ def _normalize_ollama_base(base_url: str) -> str:
 class OpenAICompatEmbeddings:
     name = "openai_compatible"
 
-    def __init__(self, *, base_url: str, api_key: str, model: str, dimensions: int) -> None:
+    def __init__(
+        self, *, base_url: str, api_key: str, model: str, dimensions: int, truncate: bool = False
+    ) -> None:
         from openai import AsyncOpenAI
 
         self.model = model
         self.dimensions = dimensions
+        self.truncate = truncate
         self._client = AsyncOpenAI(base_url=base_url, api_key=api_key, timeout=60)
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
@@ -124,7 +155,10 @@ class OpenAICompatEmbeddings:
                 model=self.model, input=chunk, dimensions=self.dimensions
             )
             vectors.extend(item.embedding for item in response.data)
-        return _check_dimensions(vectors, self.dimensions, f"openai_compatible:{self.model}")
+        source = f"openai_compatible:{self.model}"
+        if self.truncate:
+            vectors = _mrl_truncate(vectors, self.dimensions, source)
+        return _check_dimensions(vectors, self.dimensions, source)
 
     async def embed_query(self, text: str) -> list[float]:
         (vector,) = await self.embed_texts([text])
@@ -227,6 +261,7 @@ def build_embedding_client(settings: Settings) -> EmbeddingClient:
             base_url=base_url,
             model=settings.embedding_model,
             dimensions=settings.embedding_dimensions,
+            truncate=settings.embedding_truncate,
         )
 
     if not api_key:
@@ -240,6 +275,7 @@ def build_embedding_client(settings: Settings) -> EmbeddingClient:
         api_key=api_key,
         model=settings.embedding_model,
         dimensions=settings.embedding_dimensions,
+        truncate=settings.embedding_truncate,
     )
 
 
@@ -256,7 +292,7 @@ def shared_embedder(settings: Settings) -> EmbeddingClient:
     key = (
         f"{settings.embedding_provider}::{settings.embedding_base_url}"
         f"::{settings.embedding_model}::{settings.embedding_dimensions}"
-        f"::{settings.rag_use_mock_embedding}"
+        f"::{settings.embedding_truncate}::{settings.rag_use_mock_embedding}"
     )
     if _shared_client is None or _shared_key != key:
         _shared_client = build_embedding_client(settings)

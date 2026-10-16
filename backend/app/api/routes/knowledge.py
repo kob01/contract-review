@@ -36,6 +36,7 @@ from app.services.rag.ingest import (
     PLACEHOLDER_PREFIX,
     ProvisionInput,
     index_provisions,
+    rebuild_all_embeddings,
     rebuild_missing_embeddings,
     sync_sparse_index,
     upsert_enforcement_case,
@@ -198,19 +199,30 @@ async def search_provisions(
 
 @router.post("/reindex", response_model=ReindexResult)
 async def reindex_knowledge(
+    full: bool = Query(
+        False,
+        description="true = 全量重算所有权威条文向量（换嵌入模型时用）；false = 只补缺失向量",
+    ),
     session: AsyncSession = Depends(get_db),
     app_settings: Settings = Depends(get_settings),
 ) -> ReindexResult:
-    """重建检索侧数据：补算缺失向量 + 全量同步 BM25 索引。
+    """重建检索侧数据：补算/全量重算向量 + 全量同步 BM25 索引。
 
-    换嵌入模型、调整分词口径、ES 索引被清过之后都该调一次。向量与索引
-    分开返回，通道不可用时写进 message，而不是伪装成“重建成功”。
+    换嵌入模型、调整分词口径、ES 索引被清过之后都该调一次。**换嵌入模型必须带
+    `full=true`**：同维度换模型时旧的异源向量非 NULL，只补缺失会漏掉它们，导致
+    新旧向量混空间、相似度失真。向量与索引分开返回，通道不可用时写进 message，
+    而不是伪装成“重建成功”。
     """
     notes: list[str] = []
 
     embeddings_rebuilt = 0
     try:
-        embeddings_rebuilt = await rebuild_missing_embeddings(session, _embedder(app_settings))
+        embedder = _embedder(app_settings)
+        embeddings_rebuilt = (
+            await rebuild_all_embeddings(session, embedder)
+            if full
+            else await rebuild_missing_embeddings(session, embedder)
+        )
     except Exception as exc:
         notes.append(f"向量重建未完成：{exc}")
 

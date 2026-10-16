@@ -49,14 +49,14 @@ cd frontend && npm run dev
 
 ## 技术栈
 
-| 层    | 选型                                                                                                                  |
-| ----- | --------------------------------------------------------------------------------------------------------------------- |
-| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                         |
-| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                             |
-| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                            |
-| 检索  | **pgvector**（Ollama bge-m3，1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排        |
-| 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 + 回音壁防护 |
-| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、阈值口径、结论、复核任务同源一库）                                        |
+| 层    | 选型                                                                                                                                  |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| 前端  | React 19 + Vite + TypeScript + Tailwind v4 + **PDF.js**（原件渲染与风险高亮）                                                         |
+| 后端  | FastAPI + SQLAlchemy 2.0（async）+ **uv**；任务队列为 **ARQ（Redis）**，worker 为独立进程                                             |
+| Agent | 规则引擎（自研 DSL 解释器）+ **LlamaIndex** 检索器契约 + 四路召回 RRF 融合                                                            |
+| 检索  | **pgvector**（Ollama qwen3-embedding:8b，MRL 截断到 1024 维）+ **Elasticsearch BM25**（jieba 应用侧分词）+ **TEI cross-encoder** 重排 |
+| 模型  | OpenAI 兼容接口（当前 GLM-5.3-Flash；DeepSeek / 通义 / Kimi / vLLM / Ollama 可切）；复核模型独立配置槽位 + 回音壁防护                 |
+| 数据  | PostgreSQL 16 + pgvector（法条、罚单、红线、阈值口径、结论、复核任务同源一库）                                                        |
 
 ## 双通道审查流程
 
@@ -124,7 +124,7 @@ cd frontend && npm run dev
 未配置密钥与本地服务时：LLM 走启发式 Mock、向量走确定性哈希 Mock、ES/TEI 不可达则少一路召回。
 **链路是通的，但检索相似度不具备语义含义**，健康检查、界面顶栏与报告都会显式标注这一点
 （`RAG_USE_MOCK_EMBEDDING=true` 时 `/health` 直接返回 `degraded`）。
-真实跑审查需要：`LLM_API_KEY`、本地 Ollama（bge-m3）或远端 embedding、Elasticsearch、TEI 重排服务，
+真实跑审查需要：`LLM_API_KEY`、本地 Ollama（qwen3-embedding:8b）或远端 embedding、Elasticsearch、TEI 重排服务，
 并把 `RAG_USE_MOCK_EMBEDDING=false` 与**导入权威条文原文**（否则检索只命中占位登记，全部结论进人工队列）。
 
 > 思考型模型（如 GLM-5.3-Flash）不支持关闭思考，只能用 `reasoning_effort=low|high|max|default` 调深度，

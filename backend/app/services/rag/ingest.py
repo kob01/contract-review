@@ -227,6 +227,43 @@ async def rebuild_missing_embeddings(
     return len(rows)
 
 
+async def rebuild_all_embeddings(
+    session: AsyncSession, embedder: EmbeddingClient, *, batch: int = 200
+) -> int:
+    """全量重算权威条文向量，覆盖旧向量，分批直到没有剩余。
+
+    与 `rebuild_missing_embeddings` 的关键区别：后者只补 `embedding IS NULL` 的行，
+    而**同维度换嵌入模型**（如 bge-m3 → qwen3-embedding，都是 1024 维）时旧的异源向量
+    非 NULL 会被跳过，新旧向量混在同一空间、相似度失真却不报错。换模型（即便维度不变）
+    必须走本函数强制全量重算，不能只补 NULL。
+    """
+    total = 0
+    while True:
+        result = await session.execute(
+            select(LegalProvision)
+            .where(
+                LegalProvision.is_sample.is_(False),
+                LegalProvision.is_active.is_(True),
+            )
+            .order_by(LegalProvision.id)
+            .limit(batch)
+            .offset(total)
+        )
+        rows = list(result.scalars().all())
+        if not rows:
+            break
+        texts = [_embedding_text_row(row) for row in rows]
+        vectors = await embedder.embed_texts(texts)
+        for row, vector in zip(rows, vectors, strict=True):
+            row.embedding = vector
+        await session.commit()
+        total += len(rows)
+        if len(rows) < batch:
+            break
+    logger.info("全量重算条文向量 %s 条", total)
+    return total
+
+
 def _embedding_text_row(row: LegalProvision) -> str:
     return f"《{row.law_name}》{row.article_no} {row.title or ''}\n{row.content}"
 
