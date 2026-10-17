@@ -189,6 +189,17 @@ def test_threshold_value_range_validation():
         validate_threshold_value("not_a_key", 0.5)
 
 
+def test_default_lpr_is_the_current_published_rate():
+    """默认值是业务参数不是常量：一年期 LPR 自 2025-05-20 起为 3.0%。
+
+    曾经长期停在 3.1%（2024-10 那一档），4 倍上限被算成 12.4% 而不是 12.0%，
+    民间借贷合同里 12.0%~12.4% 这一段会被整片放过。
+    """
+    default = Settings.model_fields["lpr_one_year_rate"].default
+    assert default == pytest.approx(0.030)
+    assert default * Settings.model_fields["lpr_multiple"].default == pytest.approx(0.12)
+
+
 def test_thresholds_from_settings_marks_every_source_as_settings():
     settings = build()
     loaded = Thresholds.from_settings(settings)

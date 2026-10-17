@@ -129,6 +129,65 @@ def test_checked_rule_count_respects_applies_to(rules, settings):
     assert consumer.checked_rule_count != guarantee.checked_rule_count
 
 
+def test_rate_002_cites_the_lpr_cap_article_not_the_head_interest_one(rules):
+    """锁定引用条号：现行法释〔2020〕17号里 4 倍 LPR 是第二十五条。
+
+    第二十六条讲的是"债权凭证载明金额认定为本金"（砍头息）。曾经引错成第二十六条，
+    后果是导入正确原文后 `verified=True`、前端照常展示，却拿砍头息条文给利率超限背书。
+    """
+    row = next(item for item in as_rule_rows() if item["code"] == "RATE-002")
+    refs = [ref for ref in row["basis_refs"] if "民间借贷" in ref["law_name"]]
+    assert len(refs) == 1
+    assert refs[0]["article_no"] == "第二十五条"
+
+
+def test_brch_002_does_not_fire_on_negated_joint_collection(rules, settings):
+    """"不重复计收"是合规表述，正则不得读成违规。"""
+    compliant = (
+        "第三条 逾期\n乙方逾期的，甲方按未还本金每日万分之三计收罚息，"
+        "罚息与违约金不重复计收。"
+    )
+    violating = "第三条 逾期\n乙方逾期的，逾期利息、违约金同时计收。"
+
+    _metrics, ok = evaluate(compliant, rules, settings)
+    assert "BRCH-002" not in {hit.rule_code for hit in ok.hits}
+
+    _metrics, bad = evaluate(violating, rules, settings)
+    assert "BRCH-002" in {hit.rule_code for hit in bad.hits}, "收紧正则后真违规仍须命中"
+
+
+def test_private_lending_ceiling_is_four_times_the_current_lpr():
+    """12.2% 在 4×3.0%=12.0% 下应命中；LPR 停在 3.1%（上限 12.4%）时这段区间整片漏报。"""
+    current = Settings(
+        lpr_one_year_rate=0.030,
+        lpr_multiple=4.0,
+        regulatory_cost_ceiling=0.24,
+        historical_hard_ceiling=0.36,
+    )
+    stale = Settings(
+        lpr_one_year_rate=0.031,
+        lpr_multiple=4.0,
+        regulatory_cost_ceiling=0.24,
+        historical_hard_ceiling=0.36,
+    )
+    text = (
+        "第一条 借款金额\n借款金额为 500,000 元。\n"
+        "第二条 利息\n双方约定年利率为 12.2%。\n"
+        "第三条 还款\n借款期限 12 个月，到期一次性归还本金及利息。"
+    )
+    rules = [RedLineRule(**row) for row in as_rule_rows()]
+
+    _metrics, hit_now = evaluate(
+        text, rules, current, kind=ContractKind.PRIVATE_LENDING.value
+    )
+    _metrics, hit_stale = evaluate(
+        text, rules, stale, kind=ContractKind.PRIVATE_LENDING.value
+    )
+
+    assert "RATE-002" in {hit.rule_code for hit in hit_now.hits}
+    assert "RATE-002" not in {hit.rule_code for hit in hit_stale.hits}
+
+
 def test_hit_carries_basis_refs_for_citation_check(rules, settings):
     _metrics, evaluation = evaluate(build_document().text, rules, settings)
     hit = next(item for item in evaluation.hits if item.rule_code == "RATE-001")

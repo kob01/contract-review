@@ -174,8 +174,10 @@ class Settings(BaseSettings):
     # ---------- 监管阈值（可配置，不写死在代码里）----------
     #: 这里是默认值，不是唯一真理源：运行口径以 `regulatory_thresholds` 表为准
     #: （见 app.services.rules.thresholds），表里没有该键时才退回这里
-    #: 一年期 LPR（小数，0.031 表示 3.1%），民间借贷司法保护上限 = 4 × 此值
-    lpr_one_year_rate: float = Field(default=0.031, gt=0.0, lt=0.2)
+    #: 一年期 LPR（小数口径），民间借贷司法保护上限 = 4 × 此值。
+    #: 这是会过期的业务参数：自 2025-05-20 起为 3.0%，每月 20 日前后由
+    #: 全国银行间同业拆借中心重新公布，改动只需维护 `regulatory_thresholds` 表。
+    lpr_one_year_rate: float = Field(default=0.030, gt=0.0, lt=0.2)
     #: 司法保护上限倍数
     lpr_multiple: float = Field(default=4.0, ge=1.0, le=10.0)
     #: 消费金融/小贷监管窗口指导综合成本红线

@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
 from app.models.knowledge import LegalProvision
+from app.services.rag.ingest import LAW_LEVEL_ARTICLE_NO
 from app.services.rag.retriever import RetrievedProvision
 
 logger = get_logger(__name__)
@@ -110,7 +111,12 @@ async def _lookup(
     stmt = select(LegalProvision).where(_law_name_match(law_name))
     if article_no:
         stmt = stmt.where(LegalProvision.article_no == article_no)
-    result = await session.execute(stmt.limit(1))
+    else:
+        # 只引用到"整部法规"级时，必须落在 ingest 的哨兵条号上。
+        # 不加这个约束会命中该法规任意一条已导入条文，把引错条文的结论标成"已核验"。
+        stmt = stmt.where(LegalProvision.article_no == LAW_LEVEL_ARTICLE_NO)
+    stmt = stmt.order_by(LegalProvision.id).limit(1)
+    result = await session.execute(stmt)
     return result.scalars().first()
 
 

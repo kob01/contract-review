@@ -30,6 +30,10 @@ logger = get_logger(__name__)
 
 PLACEHOLDER_PREFIX = "【原文待导入】"
 
+#: 规则只引用到"整部法规"级（`basis_refs` 里 `article_no` 为空）时，
+#: 占位登记与引用核验都用这个哨兵条号，两侧必须取同一个值。
+LAW_LEVEL_ARTICLE_NO = "全文"
+
 #: 内置登记的法规名称与效力层级，不含条文原文
 _CORE_REGISTRY: tuple[tuple[str, str], ...] = (
     ("中华人民共和国民法典", KnowledgeDocType.LAW.value),
@@ -177,11 +181,11 @@ async def ensure_registry(
             f"该条为红线规则 {rule_codes} 的引用依据，条号取自规则配置，"
             "导入官方原文前不得作为结论依据展示。"
         )
-        await _ensure(law_name, article_no or "全文", doc_type, note)
+        await _ensure(law_name, article_no or LAW_LEVEL_ARTICLE_NO, doc_type, note)
 
     for law_name, doc_type in _CORE_REGISTRY:
         await _ensure(
-            law_name, "全文", doc_type, "法规级占位登记，需导入逐条原文后才可用于引用。"
+            law_name, LAW_LEVEL_ARTICLE_NO, doc_type, "法规级占位登记，需导入逐条原文后才可用于引用。"
         )
 
     await session.commit()
