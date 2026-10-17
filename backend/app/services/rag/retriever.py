@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -53,6 +54,64 @@ _RERANK_TEXT_LIMIT = 600
 
 def _rerank_text(item: RetrievedProvision) -> str:
     return f"《{item.law_name}》{item.article_no}：{item.content[:_RERANK_TEXT_LIMIT]}"
+
+
+def _build_diagnostics(
+    *,
+    query: str,
+    by_id: dict[str, RetrievedProvision],
+    rankings: dict[str, list[str]],
+    fused_scores: dict[str, float],
+    pre_rerank_ids: list[str],
+    final_ids: list[str],
+    rerank_scores: dict[str, float],
+    rerank_applied: bool,
+    rerank_cap: int,
+    channels_used: list[str],
+    latency_seconds: float,
+) -> list[dict]:
+    """把一次检索的过程摊平成逐条文的事件列表（写 `review_retrieval_events`）。
+
+    评测要回答的不是"最后给了哪几条"，而是"该给的条文死在哪一步"：
+    融合前名次、精排分、是否被候选上限截掉、是否被阈值剔除、最终进没进提示词。
+    只留最终列表，RET-02/05/06/11 就只能永远是盲区。
+    """
+    final_set = set(final_ids)
+    scored_ids = set(rerank_scores)
+    events: list[dict] = []
+
+    for rank, provision_id in enumerate(pre_rerank_ids):
+        item = by_id.get(provision_id)
+        if item is None:
+            continue
+        rank_by_channel = {
+            channel: ranked.index(provision_id) + 1
+            for channel, ranked in rankings.items()
+            if provision_id in ranked
+        }
+        rerank_score = rerank_scores.get(provision_id)
+        # 精排 applied 却没给它打分 = 被候选上限截掉或被阈值剔除；
+        # 规则直连依据会被保护回填，那部分不算"被精排杀掉"
+        dropped = bool(rerank_applied) and provision_id not in scored_ids and rank < rerank_cap
+        events.append(
+            {
+                "query": query,
+                "provisionId": provision_id,
+                "lawName": item.law_name,
+                "articleNo": item.article_no,
+                "docType": item.doc_type,
+                "isSample": item.is_sample,
+                "rankByChannel": rank_by_channel,
+                "matchKinds": list(item.match_kinds),
+                "fusedScore": round(fused_scores.get(provision_id, item.score), 6),
+                "rerankScore": round(rerank_score, 6) if rerank_score is not None else None,
+                "inPrompt": provision_id in final_set,
+                "droppedByRerank": dropped,
+                "channelsUsed": channels_used,
+                "latencySeconds": latency_seconds,
+            }
+        )
+    return events
 
 
 @dataclass(slots=True)
@@ -164,6 +223,15 @@ class ProvisionRetriever(BaseRetriever):
         self._vector_store = vector_store
         #: 本次检索真正参与的通道，降级时不会被误报为“混合检索已启用”
         self.channels_used: list[str] = []
+        #: 逐条候选的过程留痕（融合前各通道名次、精排分、是否进提示词）。
+        #: 没有它，Recall@k 只能得到"最后给了哪几条"，永远算不出
+        #: 精排误杀率（RET-05）、逐通道独占贡献（RET-02）与位置衰减（RET-11）
+        self.last_diagnostics: list[dict] = []
+        #: 本次检索耗时（含 embedding / ES / rerank 三次网络往返）
+        self.last_latency_seconds: float = 0.0
+        #: 精排真实打分结果，仅用于 diagnostics（item.score 会被覆盖，无法回溯融合分）
+        self._last_rerank_scores: dict[str, float] = {}
+        self._last_rerank_applied: bool = False
 
     # ---------- LlamaIndex 契约 ----------
 
@@ -196,6 +264,8 @@ class ProvisionRetriever(BaseRetriever):
         limit = top_k or self._settings.rag_top_k
         width = max(limit * 3, 12)
         self.channels_used = []
+        self.last_diagnostics = []
+        started = time.perf_counter()
 
         by_id: dict[str, RetrievedProvision] = {}
         rankings: dict[str, list[str]] = {}
@@ -255,8 +325,30 @@ class ProvisionRetriever(BaseRetriever):
             key=lambda item: (item.score, not item.is_sample),
             reverse=True,
         )
+        # 精排会覆盖 item.score，先把 RRF 融合分与候选顺序快照下来供留痕
+        fused_scores = {pid: float(score) for pid, score in fused.items()}
+        pre_rerank_ids = [item.provision_id for item in ranked_items]
+
+        self._last_rerank_scores = {}
+        self._last_rerank_applied = False
         ranked_items = await self._rerank(query, ranked_items)
-        return ranked_items[:limit]
+        final = ranked_items[:limit]
+
+        self.last_latency_seconds = round(time.perf_counter() - started, 3)
+        self.last_diagnostics = _build_diagnostics(
+            query=query,
+            by_id=by_id,
+            rankings=rankings,
+            fused_scores=fused_scores,
+            pre_rerank_ids=pre_rerank_ids,
+            final_ids=[item.provision_id for item in final],
+            rerank_scores=self._last_rerank_scores,
+            rerank_applied=self._last_rerank_applied,
+            rerank_cap=max(1, self._settings.rag_rerank_max_candidates),
+            channels_used=list(self.channels_used),
+            latency_seconds=self.last_latency_seconds,
+        )
+        return final
 
     async def _prefetch_network(
         self, query: str, *, width: int, only_active: bool
@@ -327,6 +419,12 @@ class ProvisionRetriever(BaseRetriever):
             logger.info("重排后无候选达标：%s，仅保留直连命中", outcome.message)
         else:
             self.channels_used.append("rerank")
+
+        #: 留痕：精排给谁打了分、谁被剔除。算"精排误杀率"（RET-05）必须知道被丢掉的是谁
+        self._last_rerank_scores = {
+            pid: float(score) for pid, score in outcome.scores.items() if score is not None
+        }
+        self._last_rerank_applied = bool(outcome.applied)
 
         kept: list[RetrievedProvision] = []
         for item in candidates:

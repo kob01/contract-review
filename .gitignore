@@ -12,6 +12,7 @@ pnpm-debug.log*
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
 testdata/
+eval/
 
 # ---------- Python / 后端 ----------
 __pycache__/

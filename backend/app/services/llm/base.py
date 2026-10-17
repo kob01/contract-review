@@ -14,6 +14,9 @@ class LLMUsage(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    #: 思考型模型必须单列思考 token：正文为空而思考打满预算（"200 但没内容"）
+    #: 是这套栈踩过两次的坑，只有 completion_tokens 就分不清"没输出"与"想太多"
+    reasoning_tokens: int = 0
 
 
 class LLMResult(BaseModel):
@@ -25,6 +28,8 @@ class LLMResult(BaseModel):
     latency_seconds: float = 0.0
     usage: LLMUsage = Field(default_factory=LLMUsage)
     raw_content: str = ""
+    #: 供应商返回的结束原因（stop/length/tool_calls…）；截断率 GEN-02 的直接依据
+    finish_reason: str = ""
 
 
 class LLMError(RuntimeError):

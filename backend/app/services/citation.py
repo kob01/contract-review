@@ -17,6 +17,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import get_logger
+from app.models.enums import CitationVerifyCode
 from app.models.knowledge import LegalProvision
 from app.services.rag.ingest import LAW_LEVEL_ARTICLE_NO
 from app.services.rag.retriever import RetrievedProvision
@@ -28,6 +29,19 @@ def _normalize_law_name(name: str) -> str:
     """去掉书名号与空白，容忍《民法典》与 中华人民共和国民法典 的差异。"""
     cleaned = (name or "").strip().strip("《》")
     return cleaned.replace(" ", "")
+
+
+async def find_provision_id(
+    session: AsyncSession, law_name: str, article_no: str | None
+) -> str | None:
+    """把（法规名, 条号）解析成库内主键，供金标准与检索指标对齐。
+
+    金标准是按"《民法典》第五百八十五条"这种人读的写法标的，
+    而 `review_retrieval_events` 里是主键。不做这一步归一，
+    Recall@k 就得在评测侧重新实现一遍 `_lookup`，两边口径会分叉。
+    """
+    row = await _lookup(session, _normalize_law_name(law_name), article_no or "", "")
+    return str(row.id) if row is not None else None
 
 
 async def resolve_citations(
@@ -60,6 +74,9 @@ async def resolve_citations(
                     "docType": str(raw.get("docType") or raw.get("doc_type") or ""),
                     "isSample": True,
                     "verified": False,
+                    # 稳定编码：核验失败原因原本只有中文文案，"原文未导入"（知识库欠账）
+                    # 与"库里根本没有"（模型幻觉）在评测里必须分开统计，靠文案区分一改就坏
+                    "verifyCode": CitationVerifyCode.NOT_IN_KB.value,
                     "verifyReason": reason,
                     "sourceUrl": None,
                 }
@@ -81,6 +98,9 @@ async def resolve_citations(
         )
 
         citation = record.to_citation(verified=not record.is_sample)
+        citation["verifyCode"] = (
+            CitationVerifyCode.PLACEHOLDER.value if record.is_sample else CitationVerifyCode.OK.value
+        )
         if record.is_sample:
             reason = f"《{record.law_name}》{record.article_no} 仅有占位登记，原文未导入"
             reasons.append(reason)

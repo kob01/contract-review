@@ -5,6 +5,7 @@ from app.models.human_review import HumanReviewTask
 from app.models.knowledge import EnforcementCase, KnowledgeIngestRun, LegalProvision
 from app.models.redline import RedLineRule
 from app.models.review import ContractReview, ReviewFinding
+from app.models.telemetry import ReviewLlmCall, ReviewRetrievalEvent
 from app.models.threshold import RegulatoryThreshold
 
 __all__ = [
@@ -17,4 +18,6 @@ __all__ = [
     "RedLineRule",
     "RegulatoryThreshold",
     "ReviewFinding",
+    "ReviewLlmCall",
+    "ReviewRetrievalEvent",
 ]

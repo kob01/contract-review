@@ -44,6 +44,8 @@ class CandidateFinding:
     rule_confidence: float = 0.0
     hard_block: bool = False
     located: bool = True
+    #: 定位手段（exact/normalized/segment_fallback/evidence/failed），落 `ReviewFinding.locate_method`
+    locate_method: str = ""
     human_review_status: str = HumanReviewStatus.NOT_REQUIRED.value
     human_review_reason: str | None = None
     #: 复核裁定快照，由 `apply_judge_verdicts` 写入

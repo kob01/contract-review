@@ -38,9 +38,28 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "retrieval_channels": "JSONB NOT NULL DEFAULT '[]'::jsonb",
         # 僵尸巡检的判定依据：没有它就只能拿 updated_at 猜任务是否还在跑
         "heartbeat_at": "TIMESTAMPTZ",
+        # ---------- 评测埋点 ----------
+        "stage_timings": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "token_usage": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "degradations": "JSONB NOT NULL DEFAULT '[]'::jsonb",
     },
     "review_findings": {
         "judge_verdict": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+        # 硬阻断属性与核验/定位状态：不落列就只能 join 规则表并解析 JSON 才能算指标
+        "hard_block": "BOOLEAN NOT NULL DEFAULT false",
+        "verification_status": "VARCHAR(24) NOT NULL DEFAULT 'none'",
+        "locate_method": "VARCHAR(24) NOT NULL DEFAULT 'failed'",
+    },
+    "contracts": {
+        "parse_stats": "JSONB NOT NULL DEFAULT '{}'::jsonb",
+    },
+}
+
+#: 评测要按标签聚合，所以这些列需要索引；`CREATE INDEX IF NOT EXISTS` 同样幂等
+_ADDED_INDEXES: dict[str, dict[str, str]] = {
+    "review_findings": {
+        "ix_review_findings_verification": "ON review_findings (verification_status)",
+        "ix_review_findings_hard_block": "ON review_findings (hard_block)",
     },
 }
 
@@ -50,6 +69,12 @@ async def ensure_added_columns() -> None:
     for table_name, columns in _ADDED_COLUMNS.items():
         for column_name, column_ddl in columns.items():
             sql = f'ALTER TABLE "{table_name}" ADD COLUMN IF NOT EXISTS "{column_name}" {column_ddl}'
+            async with engine.begin() as conn:
+                await conn.execute(text(sql))
+
+    for indexes in _ADDED_INDEXES.values():
+        for index_name, index_clause in indexes.items():
+            sql = f'CREATE INDEX IF NOT EXISTS "{index_name}" {index_clause}'
             async with engine.begin() as conn:
                 await conn.execute(text(sql))
 

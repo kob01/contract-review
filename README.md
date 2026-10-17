@@ -151,7 +151,7 @@ backend/
     findings.py         交叉校验 + 置信度路由 + 规则复核裁定（纯函数，可单测）
     judge.py            复核调用编排（模型复核 / 确定性复核）
     review_pipeline.py  双通道编排
-  tests/                指标/切分/规则/路由/融合/LLM层/复核/独立性/配置与队列 109 条单测
+  tests/                指标/切分/规则/路由/融合/LLM层/复核/独立性/配置与队列/评测指标 145 条单测
 frontend/
   src/components/PdfViewer.tsx   PDF.js 渲染 + 文本块坐标高亮
   src/components/ThresholdEditor.tsx  阈值口径自助调整
@@ -178,14 +178,59 @@ samples/               consumer-loan-demo.txt 演示样本
 | GET  | `/api/v1/knowledge/search`                | 混合检索自检（展示召回路径与是否 mock）                                |
 | GET  | `/api/v1/health`                          | 连通性 + 降级程度（LLM/向量/队列/复核独立性/规则库/法条库）            |
 
-## 测试
+## 测试与评测
+
+单元测试只保证"函数按预期工作"；评测保证"这套系统按法律口径工作"。两者分开跑。
 
 ```bash
 cd backend
-uv run pytest              # 109 passed（指标、切分定位、规则判定、交叉校验、路由、LLM 层、
-                           # 复核独立性、配置校验、队列提交口径、阈值表、僵尸巡检）
-uv run ruff check .
+uv run pytest              # 145 passed（指标、切分定位、规则判定、交叉校验、路由、LLM 层、
+                           # 复核独立性、配置校验、队列提交口径、阈值表、僵尸巡检、
+                           # 评测指标库与埋点派生标签）
+uv run ruff check app tests ../scripts
 ```
+
+评测（口径见 `docs/EVAL_METRICS.md`，指标编号 GEN-03 / RET-01 / RTR-04 等在全链路一致引用）：
+
+```bash
+cd backend
+export PYTHONIOENCODING=utf-8 PYTHONPATH=.        # Windows git bash 必带，否则中文打印会崩
+
+# 一次性准备：金标准 + 法条原文（引用核验的前置条件）
+uv run python ../scripts/gen_gold.py              # 从规则引擎实际输出生成 testdata/gold/
+uv run python ../scripts/import_legal_corpus.py   # 导入 testdata/legal/ 的法规原文
+uv run python ../scripts/import_legal_corpus.py --vectorize   # 再补 Qdrant/BM25（需 embedding/ES）
+
+# 便宜的回归：只跑规则通道，不调模型、不花 token（适合每次提交）
+LLM_PROVIDER=mock RAG_USE_MOCK_EMBEDDING=true QUEUE_ENABLED=false \
+  uv run python ../scripts/eval.py --rule-only
+uv run python ../scripts/gate.py --stage rule-only
+
+# 完整评测：真实模型 + 真实检索，产出基线并可对比回归
+uv run python ../scripts/eval.py --set-baseline                       # 全链路
+uv run python ../scripts/eval.py --repeats 3                          # 算自一致性
+uv run python ../scripts/eval.py --baseline ../eval/reports/baseline.json   # 版本对比
+uv run python ../scripts/gate.py            # 发版门禁（全部 P0 项）
+
+# 一键串行（与 .github/workflows/eval.yml 的 rule-only 阶段同序）
+bash ../scripts/ci.sh
+STAGE=full bash ../scripts/ci.sh            # 追加真实模型全链路
+
+# 运维体检：库内口径是否还等于代码口径（本项目有两个"改了没生效"的静默真理源）
+uv run python ../scripts/audit_config_drift.py
+uv run python ../scripts/audit_config_drift.py --fix      # 确认代码侧才对时才同步
+uv run python ../scripts/harvest_golden.py                 # 复核结论 → 金标准候选（不直接改写正式集）
+```
+
+评测跑分产生的过程数据落在三处，都可 SQL 聚合：`review_llm_calls`（逐次调用的 token/思考
+token/时延/失败原因/本批看了哪些条文）、`review_retrieval_events`（融合前各通道名次、精排分、
+是否进提示词、是否被精排剔除）、`contracts.parse_stats` 与 `contract_reviews.stage_timings`/
+`token_usage`/`degradations`（解析质量、阶段耗时、成本分账、降级留痕）。
+关掉埋点用 `EVAL_TELEMETRY_ENABLED=false`，不保存模型原始响应正文用 `EVAL_STORE_RAW_OUTPUT=false`。
+
+指标口径的三条硬规则，写代码时按它来：漏报比误报贵（检出类一律报 F2 与漏报清单）、
+"没测"不等于 0 分（每个指标带 `measured`，缺数据的条目不进分母）、
+阈值必须有曲线背书（置信度路由用风险-覆盖扫描选，不拍脑袋）。
 
 ## 合规使用前提
 

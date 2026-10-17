@@ -1,0 +1,151 @@
+name: eval
+
+# 三层评测的分工（与 scripts/eval.py 的 --rule-only / --stage 对应）：
+#   static        每次 push：单元测试 + lint，秒级，不碰外部服务
+#   eval-rule-only 每次 PR：真实数据库上跑规则通道回归 + 门禁，不调模型、不花 token
+#   eval-full     每周一与手动触发：跑真实模型全链路，产出基线并上传制品
+#
+# 为什么规则通道进 PR 门禁、模型通道只定时：
+# 规则判定可复现，回归了就是正则或阈值被改坏；模型结论受供应商与思考档位影响，
+# 每次提交都跑既慢又贵，而且 3~5 个点的抖动根本不是回归。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "30 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      repeats:
+        description: 每例重跑次数（>=2 才计算自一致性）
+        required: false
+        default: "1"
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: 安装依赖
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check app tests ../scripts
+      - name: 单元测试（含指标库与埋点派生标签）
+        run: uv run pytest -q
+
+  eval-rule-only:
+    runs-on: ubuntu-latest
+    needs: static
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: contract_review
+          POSTGRES_PASSWORD: contract_review
+          POSTGRES_DB: contract_review
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U contract_review"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@localhost:5432/contract_review
+      LLM_PROVIDER: mock
+      RAG_USE_MOCK_EMBEDDING: "true"
+      QUEUE_ENABLED: "false"
+      RAG_SPARSE_ENABLED: "false"
+      RAG_RERANK_ENABLED: "false"
+      PYTHONIOENCODING: utf-8
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - name: 安装依赖
+        run: uv sync --frozen
+      - name: 夹具与规则引擎一致性
+        run: uv run python ../scripts/gen_test_contracts.py --check
+      - name: 金标准与引擎实际输出一致性
+        run: uv run python ../scripts/gen_gold.py --check
+      - name: 配置漂移审计（库内红线必须等于代码定义）
+        # 全新数据库本来就没有漂移；这一步防的是"改了代码没同步库"这类
+        # 看起来改了其实没改的事故（BRCH-002 旧正则曾在库里潜伏数周）
+        run: uv run python ../scripts/audit_config_drift.py --only rules
+      - name: 导入法条原文（引用核验的前置条件）
+        run: uv run python ../scripts/import_legal_corpus.py
+      - name: 评测（规则通道）
+        run: uv run python ../scripts/eval.py --bootstrap --rule-only --set-baseline
+      - name: 发版门禁（rule-only 阶段）
+        run: uv run python ../scripts/gate.py --stage rule-only
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-rule-only
+          path: eval/reports/*.md
+
+  eval-full:
+    # 真实模型全链路：需要供应商密钥，只在定时任务与手动触发时跑
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: static
+    environment: evaluation
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: contract_review
+          POSTGRES_PASSWORD: contract_review
+          POSTGRES_DB: contract_review
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U contract_review"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      qdrant:
+        image: qdrant/qdrant:v1.12.4
+        ports: ["6333:6333"]
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgresql+asyncpg://contract_review:contract_review@localhost:5432/contract_review
+      QDRANT_URL: http://localhost:6333
+      REDIS_URL: redis://localhost:6379/0
+      LLM_BASE_URL: https://open.bigmodel.cn/api/paas/v4
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: glm-5.3-flash
+      JUDGE_BASE_URL: https://api.deepseek.com/v1
+      JUDGE_API_KEY: ${{ secrets.JUDGE_API_KEY }}
+      JUDGE_MODEL: deepseek-flash
+      EMBEDDING_PROVIDER: openai_compatible
+      EMBEDDING_BASE_URL: ${{ secrets.EMBEDDING_BASE_URL }}
+      EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
+      EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL }}
+      EMBEDDING_DIMENSIONS: "1024"
+      RAG_USE_MOCK_EMBEDDING: "false"
+      RAG_SPARSE_ENABLED: "false"
+      RAG_RERANK_ENABLED: "false"
+      QUEUE_ENABLED: "false"
+      PYTHONIOENCODING: utf-8
+      PYTHONPATH: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v4
+      - run: uv sync --frozen
+      - run: uv run python ../scripts/import_legal_corpus.py
+      - run: uv run python ../scripts/eval.py --bootstrap --repeats ${{ github.event.inputs.repeats || '1' }} --set-baseline
+      - run: uv run python ../scripts/gate.py --stage full
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report-full
+          path: eval/reports/*

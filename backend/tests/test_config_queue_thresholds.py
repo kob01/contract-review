@@ -79,10 +79,28 @@ def test_audit_warnings_surface_known_degradations():
         judge_enabled=True,
         judge_model="glm-5.3-flash",
         llm_model="glm-5.3-flash",
+        # 显式同端点：这条用例测的就是"同来路复核"这一种降级
+        judge_base_url="",
+        judge_api_key="",
     )
     warnings = " ".join(settings.audit_warnings())
     assert "mock 向量" in warnings
     assert "不是独立信号" in warnings
+
+
+def test_audit_warnings_surface_foreign_judge_without_own_key():
+    """跨供应商复核缺密钥要说出来：否则 /health 看着正常，其实一次复核都没跑。"""
+    settings = build(
+        llm_api_key="sk-test",
+        llm_model="glm-5.3-flash",
+        judge_enabled=True,
+        rag_use_mock_embedding=False,
+        judge_base_url="https://api.deepseek.com/v1",
+        judge_model="deepseek-flash",
+        judge_api_key="",
+    )
+    warnings = " ".join(settings.audit_warnings())
+    assert "不执行结论复核" in warnings
 
 
 # ---------- 任务提交口径 ----------

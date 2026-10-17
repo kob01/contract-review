@@ -12,16 +12,19 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
+
+from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.core.logging import get_logger
-from app.models.enums import CrossCheckStatus, FindingSource
+from app.models.enums import CrossCheckStatus, FindingSource, ModelSlot
 from app.schemas.review import JudgeBatchDraft
 from app.services.findings import CandidateFinding
 from app.services.llm.base import LLMError, LLMProvider
 from app.services.llm.factory import JUDGE_MODE_RULE_CHECK, RULE_CHECK_MODEL, JudgeSlot
-from app.services.llm.prompts import build_judge_system_prompt, build_judge_user_prompt
+from app.services.llm.prompts import PROMPT_VERSION, build_judge_system_prompt, build_judge_user_prompt
 from app.services.rag.retriever import RetrievedProvision
 
 logger = get_logger(__name__)
@@ -35,6 +38,9 @@ class JudgeOutcome:
     calls: int = 0
     failed_batches: int = 0
     verdicts: dict[int, dict] = field(default_factory=dict)
+    #: 逐次调用留痕（token、思考 token、延时、失败原因），写 `review_llm_calls`。
+    #: 复核槽位现在是独立供应商（DeepSeek），成本与失败率必须与主审分开计
+    calls_detail: list[dict] = field(default_factory=list)
 
     @property
     def executed(self) -> bool:
@@ -120,32 +126,75 @@ async def run_llm_judge(
     )
     outcome = JudgeOutcome(model=provider.model)
     semaphore = asyncio.Semaphore(max(1, app_settings.judge_max_concurrency))
-    system_prompt = build_judge_system_prompt(provisions[: app_settings.rag_top_k * 2])
+    prompt_provisions = provisions[: app_settings.rag_top_k * 2]
+    system_prompt = build_judge_system_prompt(prompt_provisions)
+    #: 本批复核看了哪些条文：与主审同口径留痕，才能算"给了依据却没引用"（GEN-08 分母）
+    prompt_provision_ids = [item.provision_id for item in prompt_provisions]
 
-    async def invoke(batch_no: int, cases: list[dict]) -> tuple[int, list[dict], Exception | None]:
+    async def invoke(
+        batch_no: int, cases: list[dict]
+    ) -> tuple[int, list[dict], Exception | None, dict]:
+        user_prompt = build_judge_user_prompt(
+            cases,
+            batch_no=batch_no,
+            batch_total=len(batches),
+            isolate=app_settings.prompt_isolate_untrusted,
+        )
+        record = {
+            "slot": ModelSlot.JUDGE.value,
+            "batchNo": batch_no,
+            "model": provider.model,
+            "provider": provider.name,
+            "reasoningEffort": getattr(provider, "reasoning_effort", "") or "default",
+            "promptVersion": PROMPT_VERSION,
+            "charsIn": len(system_prompt) + len(user_prompt),
+            "provisionsInPrompt": prompt_provision_ids,
+            "ok": False,
+        }
+        started = time.perf_counter()
         async with semaphore:
             try:
                 result = await provider.complete_json(
                     system_prompt=system_prompt,
-                    user_prompt=build_judge_user_prompt(
-                        cases,
-                        batch_no=batch_no,
-                        batch_total=len(batches),
-                        isolate=app_settings.prompt_isolate_untrusted,
-                    ),
+                    user_prompt=user_prompt,
                 )
                 draft = JudgeBatchDraft.model_validate(result.payload)
-                return 0, [verdict.model_dump(mode="json") for verdict in draft.verdicts], None
-            except (LLMError, ValueError) as exc:
-                return 1, [], exc
+                record.update(
+                    {
+                        "ok": True,
+                        "latencySeconds": result.latency_seconds
+                        or round(time.perf_counter() - started, 3),
+                        "promptTokens": result.usage.prompt_tokens,
+                        "completionTokens": result.usage.completion_tokens,
+                        "totalTokens": result.usage.total_tokens,
+                        "reasoningTokens": result.usage.reasoning_tokens,
+                        "finishReason": result.finish_reason,
+                        "charsOut": len(result.raw_content or ""),
+                        "findingCount": len(draft.verdicts),
+                        "rawContent": result.raw_content or "",
+                    }
+                )
+                verdicts = [verdict.model_dump(mode="json") for verdict in draft.verdicts]
+                return 0, verdicts, None, record
+            except (LLMError, ValidationError) as exc:
+                record.update(
+                    {
+                        "latencySeconds": round(time.perf_counter() - started, 3),
+                        "errorType": type(exc).__name__,
+                        "errorMessage": str(exc)[:1000],
+                    }
+                )
+                return 1, [], exc, record
 
     results = await asyncio.gather(
         *(invoke(no, [case for _, case in batch]) for no, batch in enumerate(batches, 1))
     )
 
+    verdict_payloads: list[dict]
     for batch_no, (batch, result) in enumerate(zip(batches, results, strict=True), start=1):
-        failed, verdict_payloads, error = result
+        failed, verdict_payloads, error, record = result
         outcome.calls += 1
+        outcome.calls_detail.append(record)
         if failed:
             outcome.failed_batches += 1
             logger.warning("复核批次 %s 失败：%s", batch_no, error)
@@ -236,6 +285,24 @@ def run_rule_check_judge(items: list[CandidateFinding]) -> JudgeOutcome:
         return JudgeOutcome()
     verdicts = {index: rule_check_verdict(index, item) for index, item in enumerate(items)}
     outcome = JudgeOutcome(model=RULE_CHECK_MODEL, calls=1, verdicts=verdicts)
+    #: 降级口径也要留痕：否则"复核过 12 条"在评测里看不出是模型复核还是确定性复核
+    outcome.calls_detail.append(
+        {
+            "slot": ModelSlot.JUDGE.value,
+            "batchNo": 1,
+            "model": RULE_CHECK_MODEL,
+            "provider": "deterministic",
+            "reasoningEffort": "none",
+            "promptVersion": PROMPT_VERSION,
+            "ok": True,
+            "latencySeconds": 0.0,
+            "charsIn": 0,
+            "charsOut": 0,
+            "findingCount": len(verdicts),
+            "disputedCount": sum(1 for verdict in verdicts.values() if not verdict["agree"]),
+            "provisionsInPrompt": [],
+        }
+    )
     logger.info(
         "确定性规则复核：结论 %s 条，判为不成立 %s 条（未调模型）",
         len(items),

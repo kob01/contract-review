@@ -105,6 +105,54 @@ class KnowledgeDocType(StrEnum):
     INTERNAL_REDLINE = "internal_redline"  # 内部合规红线
 
 
+class CitationVerification(StrEnum):
+    """结论级引用核验状态（`ReviewFinding.verification_status`）。
+
+    核验事实原本只藏在 `citations` JSON 里，SQL 层无法聚合，
+    算"引用已核验率"（GEN-06）就得把每份审查的 JSON 拉回内存解析。
+    这里把它升成一个可分组、可加索引的结论级标签。
+    """
+
+    NONE = "none"                    # 结论未给出任何法规依据
+    VERIFIED = "verified"            # 全部引用都命中已导入原文的条文
+    PARTIAL = "partial"              # 部分已核验、部分未核验
+    PLACEHOLDER = "placeholder"      # 全部只有占位登记（原文未导入）
+    NOT_IN_KB = "not_in_kb"          # 全部未收录：几乎必然是模型编造
+
+
+class CitationVerifyCode(StrEnum):
+    """单条引用的核验结论编码，写进 `citations[].verifyCode`。
+
+    原先"未收录"与"仅占位"都只体现在中文 `verifyReason` 文本里，
+    靠文案区分核验失败原因迟早被改字句改坏；评测要按类别统计，必须有稳定编码。
+    """
+
+    OK = "ok"                        # 已核验且有权威原文
+    PLACEHOLDER = "placeholder"      # 库里有登记行，但内容是占位文本
+    NOT_IN_KB = "not_in_kb"          # 库里查不到这部法规/这个条号
+
+
+class LocateMethod(StrEnum):
+    """结论回连合同原文所使用的手段（`ReviewFinding.locate_method`）。
+
+    定位失败率与"靠哪种手段定位上"是两件事：只靠去空白匹配定位上的结论，
+    在 PDF 抽取质量差时更可能错位，评测 span 指标时必须能区分。
+    """
+
+    EXACT = "exact"                  # 原文精确子串命中
+    NORMALIZED = "normalized"        # 去空白后命中并回映射偏移
+    SEGMENT_FALLBACK = "segment_fallback"  # 只归到模型指认的条款，非精确
+    EVIDENCE = "evidence"            # 规则通道自带证据偏移
+    FAILED = "failed"                # 完全没定位上（前端高亮落空）
+
+
+class ModelSlot(StrEnum):
+    """模型调用属于哪个槽位，写进 `review_llm_calls.slot`。"""
+
+    REVIEW = "review"  # 主审通道（环节3 合规规则匹配 + 环节4 风险识别与定性）
+    JUDGE = "judge"    # 复核通道（环节7 结论复核）
+
+
 class MetricOperator(StrEnum):
     """红线规则的比较符。"""
 

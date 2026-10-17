@@ -17,11 +17,11 @@ from pathlib import Path
 
 from app.models.redline import RedLineRule
 from app.services.contract_service import infer_contract_kind
+from app.services.parser.extractor import ExtractedDocument
+from app.services.parser.segmenter import segmentize
 from app.services.rules.builtin_redlines import as_rule_rows
 from app.services.rules.engine import RuleEngine
 from app.services.rules.metrics import extract_metrics
-from app.services.parser.extractor import ExtractedDocument
-from app.services.parser.segmenter import segmentize
 from tests.fixtures import build_document
 
 ROOT = Path(__file__).resolve().parent.parent

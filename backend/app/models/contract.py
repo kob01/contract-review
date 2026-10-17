@@ -49,6 +49,12 @@ class Contract(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(32), default=ContractStatus.UPLOADED.value, nullable=False
     )
     parse_error: Mapped[str | None] = mapped_column(Text)
+    #: 解析质量留痕（评测埋点）：抽取器、页数/字符数、切分方式统计、指标命中数、 warnings、耗时。
+    #: 以前这些信息只有一行 `logger.info`，进程日志一滚就没了，
+    #: 于是 PAR-06/07/11/14（页码归属、失败归因、兜底切片占比、解析时延）全都无数据源
+    parse_stats: Mapped[dict] = mapped_column(
+        JSONType, default=dict, nullable=False, comment="解析与切分质量观测值"
+    )
     #: 上传者标识。鉴权模块落地后可改为对 users 表的外键
     owner_id: Mapped[str | None] = mapped_column(String(64), index=True)
 

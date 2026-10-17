@@ -32,12 +32,14 @@ from app.models.enums import (
     CrossCheckStatus,
     FindingSource,
     HumanReviewStatus,
+    ModelSlot,
     ReviewStatus,
     RiskLevel,
 )
 from app.models.human_review import HumanReviewTask
 from app.models.redline import RedLineRule
 from app.models.review import ContractReview, ReviewFinding
+from app.models.telemetry import ReviewLlmCall, ReviewRetrievalEvent
 from app.schemas.review import ReviewBatchDraft, ReviewFindingDraft, ReviewRunRequest
 from app.services.citation import resolve_citations
 from app.services.findings import (
@@ -73,6 +75,14 @@ from app.services.rules.engine import RuleEngine, RuleHit
 from app.services.rules.metrics import MetricSet, metric_summary_for_prompt
 from app.services.rules.seed import load_active_rules, rules_for_prompt
 from app.services.rules.thresholds import Thresholds, load_thresholds
+from app.services.telemetry import (
+    DegradationLog,
+    StageTimer,
+    citation_verification_status,
+    config_fingerprint,
+    locate_method_name,
+    summarize_token_usage,
+)
 
 logger = get_logger(__name__)
 
@@ -106,6 +116,14 @@ class ReviewPipeline:
         #: 因此每批借一个侧会话（延迟读取，避免导入时拉起引擎）
         self._session_factory = session_factory
 
+        # ---------- 评测埋点（不参与业务判定，写入失败不得影响审查）----------
+        self._timer = StageTimer()
+        self._degradations = DegradationLog()
+        #: 逐次模型调用留痕：主审与复核分槽，token/延时/失败原因各自记账
+        self._llm_records: list[dict] = []
+        #: 逐条检索过程留痕：融合前名次、精排分、是否进提示词
+        self._retrieval_events: list[dict] = []
+
     @property
     def _side_factory(self):
         if self._session_factory is not None:
@@ -126,6 +144,12 @@ class ReviewPipeline:
             raise ReviewPipelineError("关联合同已被删除")
 
         started = time.perf_counter()
+        #: 一个管道实例可能被复用（worker 复用、脚本连跑），埋点必须每次清空，
+        #: 否则上一份合同的调用记录会串到这一份的账上
+        self._timer = StageTimer()
+        self._degradations = DegradationLog()
+        self._llm_records = []
+        self._retrieval_events = []
         self._mark_running(review, contract, request)
         await self._session.commit()
 
@@ -133,10 +157,14 @@ class ReviewPipeline:
             outcome = await self._analyze(contract, request)
         except Exception as exc:
             await self._mark_failed(review, contract, exc, started)
+            # 失败样本恰恰是最需要过程数据的（哪一批炸的、思考 token 撞没撞上限），
+            # 所以埋点照写；它走独立事务，写不上也不会改动这次的失败结论
+            await self._persist_telemetry(review.id)
             raise
 
         await self._persist(review, contract, outcome, started)
         await self._session.commit()
+        await self._persist_telemetry(review.id)
         logger.info(
             "审查完成 contract=%s review=%s 结论=%s 待复核=%s",
             contract.id,
@@ -173,6 +201,11 @@ class ReviewPipeline:
         #: “DeepSeek 复核 glm”在历史报告里会长得一模一样
         options["judgeMode"] = self._judge_slot.mode
         options["judgeIndependent"] = self._judge_slot.independent
+        #: 评测可复现锚（DAT-05）：模型、阈值口径、检索参数全部固化进本次记录，
+        #: 否则两次跑分的差异分不清是代码变了还是配置漂移了
+        fingerprint = config_fingerprint(self._settings)
+        fingerprint["llm"]["promptVersion"] = PROMPT_VERSION
+        options["configFingerprint"] = fingerprint
         review.run_options = options
         review.started_at = datetime.now(UTC)
         review.heartbeat_at = datetime.now(UTC)
@@ -204,39 +237,37 @@ class ReviewPipeline:
         if not segments or not full_text:
             raise ReviewPipelineError("合同尚未解析完成，无法审查")
 
-        rules = await load_active_rules(self._session)
-        if not rules:
-            logger.warning("红线库为空，规则通道无法参与交叉校验")
+        with self._timer.stage("rules_load"):
+            rules = await load_active_rules(self._session)
+            if not rules:
+                self._degrade("redline_library_empty", "红线库为空，规则通道无法参与交叉校验")
+            # 阈值口径从库里的生效值读（法务可自助调整），不能只盯环境变量；
+            # 用的具体数值会归入本次审查快照，事后能回答“当时按哪个口径判的”
+            thresholds = await load_thresholds(self._session, self._settings)
 
-        # 阈值口径从库里的生效值读（法务可自助调整），不能只盯环境变量；
-        # 用的具体数值会归入本次审查快照，事后能回答“当时按哪个口径判的”
-        thresholds = await load_thresholds(self._session, self._settings)
-
-        evaluation = RuleEngine(rules, self._settings, thresholds).evaluate(
-            metrics,
-            full_text=full_text,
-            segments=segments,
-            contract_kind=contract.contract_kind,
-        )
-
-        rule_items = [
-            await self._rule_candidate(hit, segments, full_text) for hit in evaluation.hits
-        ]
-
-        pending_rules = await rules_for_prompt(
-            self._session, [code for code, _ in evaluation.inconclusive]
-        )
-        weak_rules = await rules_for_prompt(self._session, evaluation.weak_signals)
+        with self._timer.stage("rule_engine"):
+            evaluation = RuleEngine(rules, self._settings, thresholds).evaluate(
+                metrics,
+                full_text=full_text,
+                segments=segments,
+                contract_kind=contract.contract_kind,
+            )
+            rule_items = [
+                await self._rule_candidate(hit, segments, full_text) for hit in evaluation.hits
+            ]
+            pending_rules = await rules_for_prompt(
+                self._session, [code for code, _ in evaluation.inconclusive]
+            )
+            weak_rules = await rules_for_prompt(self._session, evaluation.weak_signals)
 
         # 合同正文是外部输入：先扫一轮“让审查系统忽略规则”这类注入措辞。
         # 不丢弃正文（正文本身可能就是规避证据），但必须让运维看得到
         injection_hits = detect_injection_attempts(full_text)
         if injection_hits:
-            logger.warning(
-                "合同 %s 正文含疑似提示注入措辞 %s 处（仅记录，不删除原文）：%s",
-                contract.id,
-                len(injection_hits),
-                " | ".join(injection_hits),
+            self._degrade(
+                "injection_signals",
+                f"正文含疑似提示注入措辞 {len(injection_hits)} 处（仅记录，不删除原文）："
+                + " | ".join(injection_hits),
             )
 
         llm_items, stats = await self._llm_channel(
@@ -248,23 +279,36 @@ class ReviewPipeline:
             focus_rules=[*pending_rules, *weak_rules],
         )
 
-        merged, conflicts = merge_and_cross_check(rule_items, llm_items)
-        apply_routing(
-            merged,
-            threshold=thresholds.confidence_routing_threshold,
-            mandatory_high_risk=self._settings.mandatory_human_review_for_high_risk,
-        )
+        with self._timer.stage("merge_routing"):
+            merged, conflicts = merge_and_cross_check(rule_items, llm_items)
+            apply_routing(
+                merged,
+                threshold=thresholds.confidence_routing_threshold,
+                mandatory_high_risk=self._settings.mandatory_human_review_for_high_risk,
+            )
 
         # 复核在路由之后跑：它只能加严（把该人工的拉进队列），不能减严
-        judge_outcome = await run_judge(
-            self._judge_slot, merged, stats["retrieved"], self._settings
-        )
-        judge_counts = apply_judge_verdicts(
-            merged,
-            judge_outcome.verdicts,
-            judge_model=judge_outcome.model,
-            min_confidence=self._settings.judge_min_confidence,
-        )
+        with self._timer.stage("judge"):
+            judge_outcome = await run_judge(
+                self._judge_slot, merged, stats["retrieved"], self._settings
+            )
+            self._llm_records.extend(judge_outcome.calls_detail)
+            judge_counts = apply_judge_verdicts(
+                merged,
+                judge_outcome.verdicts,
+                judge_model=judge_outcome.model,
+                min_confidence=self._settings.judge_min_confidence,
+            )
+        if judge_outcome.failed_batches:
+            self._degrade(
+                "judge_batches_failed",
+                f"{judge_outcome.failed_batches}/{judge_outcome.calls} 批复核失败，"
+                "相关结论标记为未复核",
+            )
+        if judge_outcome.model == RULE_CHECK_MODEL:
+            self._degrade("judge_downgraded_to_rule_check", "主审与复核同模型，改用确定性规则复核")
+        if judge_counts.get("unjudged"):
+            self._degrade("judge_unjudged", f"{judge_counts['unjudged']} 条结论没有拿到裁定")
 
         return {
             "items": merged,
@@ -276,6 +320,7 @@ class ReviewPipeline:
             "channels": stats["channels"],
             "llm_calls": stats["calls"],
             "failed_batches": stats["failed"],
+            "batch_failures": stats.get("failures", []),
             "judge_calls": judge_outcome.calls,
             "judge_failed": judge_outcome.failed_batches,
             "judge_counts": judge_counts,
@@ -284,6 +329,15 @@ class ReviewPipeline:
             "injection_hits": injection_hits,
             "thresholds": thresholds,
         }
+
+    def _degrade(self, code: str, detail: str = "") -> None:
+        """记录一处降级：既进日志也进本次审查的留痕字段。
+
+        只在日志里写一行 warning，等于降级不可统计（ORCH-06）；
+        审查记录里必须能回答"这次降了几级、降在哪一步"。
+        """
+        self._degradations.add(code, detail)
+        logger.warning("降级留痕 [%s]：%s", code, detail)
 
     # ---------- 规则通道 ----------
 
@@ -295,6 +349,10 @@ class ReviewPipeline:
         position = None
         if hit.evidence is not None and hit.evidence.excerpt:
             position = locate_excerpt(segments, full_text, hit.evidence.excerpt)
+
+        located = position is not None or hit.evidence is not None
+        if not located:
+            self._degrade("rule_hit_not_located", f"{hit.rule_code} 的命中证据无法回连合同原文")
 
         return CandidateFinding(
             title=hit.title,
@@ -319,7 +377,9 @@ class ReviewPipeline:
             or (hit.evidence.char_end if hit.evidence else None),
             citations=citations,
             hard_block=hit.hard_block,
-            located=position is not None or hit.evidence is not None,
+            located=located,
+            # 规则通道的偏移优先来自抽取时的证据本身，与模型 excerpt 回连是两条链路
+            locate_method=(position or {}).get("method") or ("evidence" if hit.evidence else "failed"),
         )
 
     # ---------- LLM + RAG 通道 ----------
@@ -341,6 +401,8 @@ class ReviewPipeline:
             "failed": 0,
             "batches": 0,
             "channels": [],
+            #: 每批失败的原因，落 `review_llm_calls` 之外也留在 stats 里供报告与评测直接取用
+            "failures": [],
         }
         if request.rule_only:
             return [], stats
@@ -358,13 +420,15 @@ class ReviewPipeline:
         ]
 
         # 1) 逐批检索（并发，每批一个侧会话），累积去重后的条文池
-        pool, case_pool, channels = await self._retrieve_for_batches(
-            batches,
-            contract=contract,
-            focus_rules=focus_rules,
-            basis_refs=basis_refs,
-            top_k=request.top_k,
-        )
+        with self._timer.stage("retrieval"):
+            pool, case_pool, channels, retrieval_events = await self._retrieve_for_batches(
+                batches,
+                contract=contract,
+                focus_rules=focus_rules,
+                basis_refs=basis_refs,
+                top_k=request.top_k,
+            )
+        self._retrieval_events.extend(retrieval_events)
         stats["channels"] = channels
         stats["retrieved"] = list(pool.values())
         stats["cases"] = list(case_pool.values())
@@ -399,26 +463,76 @@ class ReviewPipeline:
             user_prompt = build_user_prompt(
                 batch, batch_no=index, batch_total=len(batches), isolate=isolate
             )
+            record = {
+                "slot": ModelSlot.REVIEW.value,
+                "batchNo": index,
+                "model": self._provider.model,
+                "provider": self._provider.name,
+                "reasoningEffort": getattr(self._provider, "reasoning_effort", "") or "default",
+                "promptVersion": PROMPT_VERSION,
+                "charsIn": len(system_prompt) + len(user_prompt),
+                "segmentIndexes": [int(seg.get("index") or 0) for seg in batch],
+                "provisionsInPrompt": [item.provision_id for item in provisions],
+                "ok": False,
+            }
+            started = time.perf_counter()
             async with semaphore:
                 stats["calls"] += 1
                 try:
                     result = await self._provider.complete_json(
                         system_prompt=system_prompt, user_prompt=user_prompt
                     )
-                    return ReviewBatchDraft.model_validate(result.payload), batch, None
+                    draft = ReviewBatchDraft.model_validate(result.payload)
+                    record.update(
+                        {
+                            "ok": True,
+                            "latencySeconds": result.latency_seconds
+                            or round(time.perf_counter() - started, 3),
+                            "promptTokens": result.usage.prompt_tokens,
+                            "completionTokens": result.usage.completion_tokens,
+                            "totalTokens": result.usage.total_tokens,
+                            "reasoningTokens": result.usage.reasoning_tokens,
+                            "finishReason": result.finish_reason,
+                            "charsOut": len(result.raw_content or ""),
+                            "findingCount": len(draft.findings),
+                            "rawContent": result.raw_content or "",
+                        }
+                    )
+                    return draft, batch, None, record
                 except (LLMError, ValidationError) as exc:
-                    return None, batch, exc
+                    record.update(
+                        {
+                            "latencySeconds": round(time.perf_counter() - started, 3),
+                            "errorType": type(exc).__name__,
+                            "errorMessage": str(exc)[:1000],
+                        }
+                    )
+                    return None, batch, exc, record
 
-        results = await asyncio.gather(*(invoke(i, b) for i, b in enumerate(batches, 1)))
+        with self._timer.stage("llm"):
+            results = await asyncio.gather(*(invoke(i, b) for i, b in enumerate(batches, 1)))
 
         # 4) 顺序做引用核验与原文定位
         full_text = contract.content_text or ""
         valid_case_ids = set(case_pool)
         candidates: list[CandidateFinding] = []
-        for draft, batch, error in results:
+        for batch, (draft, _batch, error, record) in zip(batches, results, strict=True):
+            self._llm_records.append(record)
             if error is not None or draft is None:
                 stats["failed"] += 1
-                logger.warning("批次 %s 模型输出无效：%s", batch[0].get("index"), error)
+                stats["failures"].append(
+                    {
+                        "batchNo": record.get("batchNo"),
+                        "errorType": record.get("errorType", ""),
+                        "errorMessage": record.get("errorMessage", ""),
+                    }
+                )
+                self._degrade(
+                    "llm_batch_invalid",
+                    f"第 {record.get('batchNo')} 批（条款 {_batch[0].get('index')} 起）"
+                    f"输出无效：{record.get('errorType')}",
+                )
+                logger.warning("批次 %s 模型输出无效：%s", _batch[0].get("index"), error)
                 continue
             for finding in draft.findings:
                 candidates.append(
@@ -427,6 +541,12 @@ class ReviewPipeline:
                     )
                 )
 
+        if stats["failed"]:
+            logger.warning(
+                "本批审查有 %s/%s 批模型输出无效，已按批次降级但不阻塞其余结论",
+                stats["failed"],
+                stats["calls"],
+            )
         return candidates, stats
 
     async def _retrieve_for_batches(
@@ -437,18 +557,24 @@ class ReviewPipeline:
         focus_rules: list[RedLineRule],
         basis_refs: list[tuple[str, str | None]],
         top_k: int | None,
-    ) -> tuple[dict[str, RetrievedProvision], dict[str, RetrievedCase], list[str]]:
+    ) -> tuple[dict[str, RetrievedProvision], dict[str, RetrievedCase], list[str], list[dict]]:
         """把逐批检索并发出去。
 
         串行 for 循环里每批要等 embedding HTTP + ES HTTP + 重排 HTTP，
         这些都不依赖上一批的结果，排队做就是白付 N 倍延时。
         并发度沿用 `LLM_MAX_CONCURRENCY`，避免一次审查同时打满连接池与供应商限速。
+
+        第四个返回值是逐批检索过程留痕（融合前各通道名次、精排分、是否进了最终列表）。
+        注意 `inPrompt` 的口径是"进了检索器最终列表"，不等于"进了该批提示词"——
+        后者还要经 `_rank_provisions` 二次排序与截断，那份名单记在
+        `review_llm_calls.provisions_in_prompt`，两个口径分别算 RET-01 与 GEN-08。
         """
         pool: dict[str, RetrievedProvision] = {}
         case_pool: dict[str, RetrievedCase] = {}
         channels: list[str] = []
+        events: list[dict] = []
         if not batches:
-            return pool, case_pool, channels
+            return pool, case_pool, channels, events
 
         semaphore = asyncio.Semaphore(max(1, self._settings.llm_max_concurrency))
         factory = self._side_factory
@@ -466,7 +592,7 @@ class ReviewPipeline:
                 )
                 items = await retriever.search(query, refs=basis_refs, top_k=top_k)
                 cases = await retriever.search_cases(query)
-                return items, cases, list(retriever.channels_used)
+                return items, cases, list(retriever.channels_used), list(retriever.last_diagnostics)
 
         results = await asyncio.gather(
             *(search_one(batch) for batch in batches), return_exceptions=True
@@ -475,9 +601,10 @@ class ReviewPipeline:
         for index, result in enumerate(results, start=1):
             if isinstance(result, BaseException):
                 # 一批检索失败不带走整次审查：规则通道仍在，其余批次照常出结论
+                self._degrade("retrieval_batch_failed", f"第 {index} 批检索失败：{result}")
                 logger.warning("第 %s 批检索失败，本批仅用已有条文池：%s", index, result)
                 continue
-            items, cases, used = result
+            items, cases, used, diagnostics = result
             for item in items:
                 pool.setdefault(item.provision_id, item)
             for case in cases:
@@ -485,7 +612,17 @@ class ReviewPipeline:
             for kind in used:
                 if kind not in channels:
                     channels.append(kind)
-        return pool, case_pool, channels
+            for event in diagnostics:
+                event["batchNo"] = index
+                events.append(event)
+
+        missing = [channel for channel in ("vector", "bm25", "rerank") if channel not in channels]
+        if missing:
+            self._degrade(
+                "retrieval_channels_degraded",
+                f"未参与的召回通道：{', '.join(missing)}（报告不得称完整混合检索）",
+            )
+        return pool, case_pool, channels, events
 
     async def _llm_candidate(
         self,
@@ -499,9 +636,16 @@ class ReviewPipeline:
         # 模型回指的 excerpt 来自被转义过的提示词，先换回半角再定位，否则回连不上原文
         excerpt = restore_untrusted(finding.excerpt)
         position = locate_excerpt(segments, full_text, excerpt)
+        method = (position or {}).get("method")
         if position is None and finding.segment_index is not None:
             # 退一步：至少归到模型指认的条款上，但标记为未精确定位
             position = _segment_position(segments, finding.segment_index)
+            method = "segment_fallback"
+        if position is None:
+            self._degrade(
+                "llm_excerpt_not_located",
+                f"模型引用的片段无法回连原文（rule={finding.rule_code or '-'}）：{excerpt[:60]}",
+            )
 
         citations, _ = await resolve_citations(
             self._session,
@@ -534,6 +678,7 @@ class ReviewPipeline:
             citations=citations,
             similar_case_ids=case_ids,
             located=position is not None,
+            locate_method=method or ("segment_fallback" if position else "failed"),
         )
 
     # ---------- 落库 ----------
@@ -579,6 +724,13 @@ class ReviewPipeline:
                 similar_case_ids=item.similar_case_ids,
                 judge_verdict=item.judge_verdict,
                 human_review_status=item.human_review_status,
+                hard_block=item.hard_block,
+                verification_status=citation_verification_status(item.citations),
+                locate_method=locate_method_name(
+                    located=item.located,
+                    method=item.locate_method,
+                    has_evidence=bool(item.metric_snapshot),
+                ),
                 order_index=index,
             )
             self._session.add(finding)
@@ -641,7 +793,83 @@ class ReviewPipeline:
         review.status = ReviewStatus.SUCCEEDED.value
         review.finished_at = datetime.now(UTC)
         review.elapsed_seconds = round(time.perf_counter() - started, 3)
+        # ---------- 评测埋点（审查级聚合）----------
+        review.stage_timings = self._timer.as_dict()
+        review.token_usage = summarize_token_usage(self._llm_records)
+        review.degradations = self._degradations.to_list()
+        review.run_options = {
+            **(review.run_options or {}),
+            "llmFailures": outcome.get("batch_failures") or [],
+            "degradationCodes": self._degradations.codes(),
+        }
         contract.status = ContractStatus.REVIEWED.value
+
+
+    async def _persist_telemetry(self, review_id: uuid.UUID) -> None:
+        """把逐次模型调用与检索过程写到旁路会话的独立事务里。
+
+        刻意不与主审查共用事务：一次埋点 INSERT 失败会 abort 整个事务，
+        那就等于让"观测"有能力把一份已完成的审查打成失败——本末倒置。
+        埋点丢失只该记一条 warning，评测跑分时按缺数据显式报"未验证"。
+        """
+        if not self._settings.eval_telemetry_enabled:
+            return
+        if not self._llm_records and not self._retrieval_events:
+            return
+
+        store_raw = self._settings.eval_store_raw_output
+        try:
+            async with self._side_factory() as side_session:
+                for record in self._llm_records:
+                    side_session.add(
+                        ReviewLlmCall(
+                            review_id=review_id,
+                            slot=str(record.get("slot") or ModelSlot.REVIEW.value),
+                            batch_no=int(record.get("batchNo") or 0),
+                            model=str(record.get("model") or ""),
+                            provider=str(record.get("provider") or ""),
+                            reasoning_effort=str(record.get("reasoningEffort") or "default"),
+                            prompt_version=str(record.get("promptVersion") or ""),
+                            ok=bool(record.get("ok", False)),
+                            error_type=str(record.get("errorType") or ""),
+                            error_message=str(record.get("errorMessage") or ""),
+                            latency_seconds=float(record.get("latencySeconds") or 0.0),
+                            prompt_tokens=int(record.get("promptTokens") or 0),
+                            completion_tokens=int(record.get("completionTokens") or 0),
+                            total_tokens=int(record.get("totalTokens") or 0),
+                            reasoning_tokens=int(record.get("reasoningTokens") or 0),
+                            finish_reason=str(record.get("finishReason") or ""),
+                            chars_in=int(record.get("charsIn") or 0),
+                            chars_out=int(record.get("charsOut") or 0),
+                            finding_count=int(record.get("findingCount") or 0),
+                            provisions_in_prompt=list(record.get("provisionsInPrompt") or []),
+                            raw_content=str(record.get("rawContent") or "") if store_raw else "",
+                        )
+                    )
+                for event in self._retrieval_events:
+                    side_session.add(
+                        ReviewRetrievalEvent(
+                            review_id=review_id,
+                            batch_no=int(event.get("batchNo") or 0),
+                            query=str(event.get("query") or ""),
+                            provision_id=str(event.get("provisionId") or ""),
+                            law_name=str(event.get("lawName") or ""),
+                            article_no=str(event.get("articleNo") or ""),
+                            doc_type=str(event.get("docType") or ""),
+                            is_sample=bool(event.get("isSample", False)),
+                            rank_by_channel=dict(event.get("rankByChannel") or {}),
+                            match_kinds=list(event.get("matchKinds") or []),
+                            fused_score=float(event.get("fusedScore") or 0.0),
+                            rerank_score=event.get("rerankScore"),
+                            in_prompt=bool(event.get("inPrompt", False)),
+                            dropped_by_rerank=bool(event.get("droppedByRerank", False)),
+                            lexical_overlap=float(event.get("lexicalOverlap") or 0.0),
+                            latency_seconds=float(event.get("latencySeconds") or 0.0),
+                        )
+                    )
+                await side_session.commit()
+        except Exception as exc:  # pragma: no cover - 埋点失败不影响业务
+            logger.warning("评测埋点写入失败（不影响审查结果）review=%s：%s", review_id, exc)
 
 
 class _FakeHit:

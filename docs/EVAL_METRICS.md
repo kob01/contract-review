@@ -320,3 +320,76 @@ L5 生成（17）：契约合格率、空正文/截断、发现级 P/R/F1/F2、s
 L6 归并（5）｜L7 裁定（6）｜L8 路由（12：AUROC、风险-覆盖与 AURC、ECE/Brier、漏报逃逸、转人工精确、reason 归因、高危强制、负荷率、自动精确率、严重度校准、复核时效、飞轮转化）｜L9 报告（4）｜L10 编排（10）｜L11 安全（8）｜L12 业务（5）｜L13 方法学（8）。
 
 合计 150 项，其中**零标注成本、纯自动可算、建议第一批做的 12 项**：GEN-01、GEN-02、GEN-06、GEN-07、GEN-10、MRG-05、RPT-01/02/03、EXT-07/12/13、RULE-06/07、RET-08/10、RTR-05/07/08/11、ORCH-03/04/07/09。这些只依赖已有落库字段与一致性复算，能把"评测有没有开始"这件事立刻变成 0/1。
+
+---
+
+## 19. 实现状态（2026-10-17 改造后）
+
+本节记录"上面这份清单里，哪些已经真的能算、算出来是多少、哪些还差什么"。
+没实现的直接写在缺数据源上，不写"部分支持"这种无法验证的话。
+
+### 19.1 已落地的埋点与数据源
+
+| 新增落点 | 位置 | 解锁的指标 |
+| --- | --- | --- |
+| `review_llm_calls` | 新表（`models/telemetry.py`）：槽位、批次、模型、思考档位、ok/失败类型、时延、prompt/completion/**reasoning** token、finish_reason、输入输出字符数、**本批进入提示词的条文 id**、原始响应 | GEN-01、GEN-02、GEN-08 分母、GEN-16、ORCH-07 |
+| `review_retrieval_events` | 新表：本批查询串、条文主键、**融合前各通道名次**、RRF 融合分、精排分、是否进最终列表、是否被精排剔除、占位标记 | RET-01、RET-02、RET-05、RET-06、RET-08、RET-11 |
+| `ReviewFinding.hard_block / verification_status / locate_method` | 三个可 SQL 聚合的结论级标签 | RULE-03、GEN-06、GEN-12、RTR-06 |
+| `Contract.parse_stats` | 抽取器、字符/页数、切分数、**兜底切片占比**、指标证据/派生/warnings 数、解析三阶段耗时 | PAR-07、PAR-11、PAR-14 |
+| `ContractReview.stage_timings / token_usage / degradations` | 阶段耗时（含"已计账比例"，暴露埋点缝隙）、分槽 token 账、**降级编码清单** | ORCH-06、ORCH-07、GEN-16 |
+| `run_options.configFingerprint` | 模型/复核形态/检索参数/路由阈值的配置指纹 | DAT-05 |
+| `citations[].verifyCode` | `ok` / `placeholder` / `not_in_kb` 稳定编码 | GEN-07 分类、GEN-06 |
+
+### 19.2 已可计算的指标与首轮实测
+
+评测入口：`scripts/eval.py`（跑分）+ `scripts/gate.py`（门禁）+ `scripts/gen_gold.py`（金标准）
++ `scripts/import_legal_corpus.py`（法条原文入库）+ `scripts/audit_config_drift.py`（口径漂移）
++ `scripts/harvest_golden.py`（复核回流）。指标库在 `app/services/eval/{metrics,retrieval,calibration,report,gold,runner}.py`，
+145 条单测里有 24 条专门用手算期望值验证它们。
+
+rule-only 阶段（29 份原样本 + 3 份注入对抗样本，真实数据库）已出数：
+
+| 指标 | 实测 | 解读 |
+| --- | --- | --- |
+| RULE-01 检出 micro 召回 | **1.0**，F2 0.9955 | 规则通道对其可判的红线全命中；金标准由同一引擎派生，这个数字只证明"没退化"，不证明"够好" |
+| RULE-03 硬阻断漏报 | **0** | 8 条 hard_block 无漏报 |
+| GEN-06 引用已核验率 | **0.9375**（导入原文前 0.0444） | 法条入库直接把这个指标从地板抬到九成，印证"知识库欠账 ≠ 模型质量问题" |
+| GEN-07 引用未收录率 | **0.0** | 门禁 G3 由 ❌ 转 ✅ |
+| RPT-01/02/03 报告自洽 | **29/29 份无矛盾** | 零标注成本，已进 CI |
+| SEC-01 注入攻击成功率 | **0.0**（2 组配对） | 规则引擎不受注入影响；模型通道的 ASR 要等 `--stage full` |
+| DAT-01 标注覆盖度 | severity 100%、span 86%、refs 100%；20 条红线正例不足 3 份 | span 缺的 14% 全是"派生指标命中、无单一原文区间"——如实记录而非假装定位失败 |
+| GEN-16 / ORCH-06 | token 与降级编码已落库 | rule-only 下模型类指标显式报"未测"，不冒充通过 |
+
+### 19.3 评测框架第一次跑分抓到的真实缺陷
+
+这两条都不是理论风险，是跑出来的：
+
+1. **库内红线定义与代码不一致导致线上误报**。`red_line_rules` 里 BRCH-002 的关键词正则
+   仍是没有否定词守卫的旧版本（`ensure_builtin_rules` 只补缺不覆盖），而
+   `builtin_redlines.py` 早已修复。后果：生产路径在 `EDGE-25_否定表述不误报` 上误报，
+   而 `gen_test_contracts.py --check`（用代码定义构造引擎）一直是绿的——
+   两条断言看着同一件事，其实查的是两个真相源。已由 `audit_config_drift.py` 独立报出，
+   修法是 `uv run python ../scripts/audit_config_drift.py --only rules --fix`。
+2. **派生指标命中的结论无法回连原文**。RATE-001 由 `max_annual_cost_rate`（取最劣口径）
+   命中时 `hit.evidence` 为空，前端高亮落不了地，`located=False` 被路由记成
+   `metric_missing`。金标准如实写成"无区间"，GEN-12 的分母因此没被污染。
+
+另外发现两处"看起来存在的开关"（会误导评测口径，已在代码里改名或标注）：
+`enums.CONFIDENCE_ROUTING_THRESHOLD` 全仓未被引用；`builtin_redlines` 注释声称的
+`needs_verification=True` 字段不存在。
+
+### 19.4 仍缺什么才能测剩下的指标
+
+| 阻塞项 | 影响指标 | 需要的动作 |
+| --- | --- | --- |
+| 模型通道金标准（LLM 才能发现的模糊结论） | GEN-03/04/05/09/13 的完整口径 | 律师按 19.2 的候选流程标注；`harvest_golden.py` 已把复核结论转成候选，但**不自动进正式集**（否则系统用自己的输出给自己打分） |
+| `JUDGE_API_KEY` 未填 | JDG-01/02/03、GEN-16 复核成本、G5/G7 门禁 | 在 `.env` 填 DeepSeek 密钥；当前配置在缺密钥时**不执行复核并显式报未复核**，不会拿主审密钥去撞别家端点 |
+| PDF / DOCX / 扫描件夹具 | PAR-01/02/04/05/06/08/10 | 生成真实格式夹具（现全部为 `.txt`，抽取保真与页码归属从未被测过） |
+| Ollama / ES / TEI 未常驻 | RET-01/05/06/07/11 的真实数字 | 起 embedding 与 BM25/精排服务后跑 `--vectorize` + `eval`（不在线时相关指标报"未测"，不会假通过） |
+| 阈值边界扫描集、跨种类误用集 | RULE-05/07/08/11 | 每阈值 ±1pp 带内 ≥8 点、每 kind 的误用样本，需法律判断 |
+| 线上复核数据与工时 | RTR-09/10、BIZ-01/02/05 | 需要真实使用量；管道已备好，指标要数据积累 |
+| 双标一致性（κ） | DAT-02 | 至少两名法务独立标同一子集 |
+
+**当前门禁状态**：`gate.py --stage rule-only` 因 G6（合规合同不误报）未过——
+原因就是 19.3 第 1 条的库内旧正则。它现在被门禁拦着，而不是被单测放行。
+

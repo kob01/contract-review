@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, JSONType, TimestampMixin, UUIDPrimaryKeyMixin
@@ -85,6 +85,21 @@ class ContractReview(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #: 没有独立心跳字段就只能“把慢任务当死任务杀掉”或者“让死任务假活几小时”
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # ---------- 评测埋点（只观测不参与业务判定）----------
+    #: 各阶段墙钟耗时 {"rules":1.2,"retrieval":3.4,"llm":88.1,...} 与总量、已计账比例。
+    #: 只有一个 `elapsed_seconds` 就无法定位瓶颈在检索还是模型，也就没有 PAR-14/RET-14/GEN-16
+    stage_timings: Mapped[dict] = mapped_column(
+        JSONType, default=dict, nullable=False, comment="阶段耗时与降级留痕（评测用）"
+    )
+    #: token 用量按槽位分账：主审与复核是两家供应商，混算得出不了"每份合同成本"
+    token_usage: Mapped[dict] = mapped_column(
+        JSONType, default=dict, nullable=False, comment="主审/复核分槽 token 与延时汇总"
+    )
+    #: 本次运行发生过的降级点清单（通道缺失、批次失败、定位回退…）
+    degradations: Mapped[list[dict]] = mapped_column(
+        JSONType, default=list, nullable=False, comment="降级留痕（ORCH-06）"
+    )
+
     contract: Mapped[Contract] = relationship(back_populates="reviews")
     findings: Mapped[list[ReviewFinding]] = relationship(
         back_populates="review",
@@ -160,6 +175,22 @@ class ReviewFinding(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     human_comment: Mapped[str | None] = mapped_column(Text)
     adjusted_risk_level: Mapped[str | None] = mapped_column(String(16))
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    # ---------- 评测埋点 ----------
+    #: 规则自带的阻断属性。以前只活在 `CandidateFinding` 上、没落库，
+    #: 于是"硬阻断红线是否 100% 拦住"（RULE-03）只能回头 join 规则表去猜
+    hard_block: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, comment="所属红线是否硬阻断"
+    )
+    #: 结论级引用核验状态（verified/partial/placeholder/not_in_kb/none）。
+    #: 核验事实原本只藏在 citations JSON 里，无法用 SQL 聚合算引用已核验率
+    verification_status: Mapped[str] = mapped_column(
+        String(24), default="none", nullable=False, comment="引用核验状态（GEN-06）"
+    )
+    #: 原文定位手段（exact/normalized/segment_fallback/evidence/failed）
+    locate_method: Mapped[str] = mapped_column(
+        String(24), default="failed", nullable=False, comment="回连原文的手段（GEN-12）"
+    )
 
     order_index: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 

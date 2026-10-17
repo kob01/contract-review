@@ -107,6 +107,17 @@ def describe_judge_backend(settings: Settings) -> JudgeSlot:
     if not (settings.judge_api_key or settings.llm_api_key):
         return JudgeSlot(mode=JUDGE_MODE_DISABLED, warning="未配置复核密钥，本次不执行结论复核")
 
+    #: 跨供应商复核却没有那家的密钥：不能拿主审密钥去撞别家端点（必然成批 401，
+    #: 且会把"复核失败"伪装成"模型质量差"）。宁可显式不复核，也不制造假失败
+    if settings.judge_missing_own_key:
+        return JudgeSlot(
+            mode=JUDGE_MODE_DISABLED,
+            warning=(
+                f"复核端点 {settings.judge_base_url} 与主审不同但未配置 JUDGE_API_KEY，"
+                "已跳过结论复核（不得复用主审密钥）"
+            ),
+        )
+
     if main_slot_will_mock(settings):
         return JudgeSlot(
             mode=JUDGE_MODE_DISABLED,

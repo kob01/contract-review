@@ -47,6 +47,12 @@ def _extract_json_object(content: str) -> dict[str, Any]:
     return parsed
 
 
+def _reasoning_tokens(usage: Any) -> int:
+    """从 OpenAI 兼容响应里取思考 token 数；供应商不返回该字段时得 0。"""
+    details = getattr(usage, "completion_tokens_details", None) if usage is not None else None
+    return int(getattr(details, "reasoning_tokens", 0) or 0)
+
+
 class OpenAICompatibleProvider:
     name = "openai_compatible"
 
@@ -109,18 +115,17 @@ class OpenAICompatibleProvider:
                 last_error = exc
                 logger.warning("LLM 服务端错误（第 %s 次）：%s", attempt, exc.status_code)
             else:
-                message = completion.choices[0].message
+                choice = completion.choices[0]
+                message = choice.message
                 content = (message.content or "").strip()
+                finish_reason = choice.finish_reason or ""
+                usage = completion.usage
                 if not content:
                     # 思考型模型最常见的失败不是报错而是“空回”：推理 token 把
                     # max_tokens 预算占完，正文一个字都没输出。不能只写“返回空内容”，
                     # 运维看不出是预算不够还是模型真的无话可说
-                    finish_reason = completion.choices[0].finish_reason
                     reasoning = getattr(message, "reasoning_content", None) or ""
-                    usage = completion.usage
-                    reasoning_tokens = getattr(
-                        getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None
-                    )
+                    reasoning_tokens = _reasoning_tokens(usage)
                     if finish_reason == "length":
                         raise LLMError(
                             f"模型只输出思考内容就撞到 max_tokens 上限（思考 token={reasoning_tokens}，"
@@ -131,7 +136,6 @@ class OpenAICompatibleProvider:
                         f"LLM 返回空内容（finish_reason={finish_reason}, reasoning {len(reasoning)} 字）"
                     )
                 latency = time.perf_counter() - started
-                usage = completion.usage
                 return LLMResult(
                     payload=_extract_json_object(content),
                     model=completion.model or self.model,
@@ -141,8 +145,10 @@ class OpenAICompatibleProvider:
                         prompt_tokens=usage.prompt_tokens if usage else 0,
                         completion_tokens=usage.completion_tokens if usage else 0,
                         total_tokens=usage.total_tokens if usage else 0,
+                        reasoning_tokens=_reasoning_tokens(usage),
                     ),
                     raw_content=content,
+                    finish_reason=finish_reason,
                 )
 
             if attempt < 3:

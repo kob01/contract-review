@@ -164,11 +164,14 @@ def batch_segments(segments: list[dict], max_chars: int) -> list[list[dict]]:
 
 
 def locate_excerpt(segments: list[dict], full_text: str, excerpt: str) -> dict | None:
-    """把一段原文引用定位回 `{"segment_index","char_start","char_end","page_no"}`。
+    """把一段原文引用定位回 `{"segment_index","char_start","char_end","page_no","method"}`。
 
     模型返回的引用常带空白差异，因此先做精确匹配，失败后退化为
     "去空白后再匹配"，最后只能定位到条款级；完全找不到则返回 None，
     由上层标注为"引用未定位"，绝不假装定位成功。
+
+    `method` 是评测埋点：精确匹配与模糊匹配定位上的结论，在 PDF 抽取质量差时的
+    错位风险不同，必须能分开统计（GEN-12）。
     """
     needle = excerpt.strip()
     if not needle:
@@ -176,7 +179,7 @@ def locate_excerpt(segments: list[dict], full_text: str, excerpt: str) -> dict |
 
     hit = full_text.find(needle)
     if hit >= 0:
-        return _wrap_position(segments, full_text, hit, hit + len(needle))
+        return _wrap_position(segments, full_text, hit, hit + len(needle), method="exact")
 
     compact = _strip_ws(full_text)
     compact_needle = _strip_ws(needle)
@@ -185,7 +188,7 @@ def locate_excerpt(segments: list[dict], full_text: str, excerpt: str) -> dict |
         # 压缩后的偏移映射回原始偏移
         start = _map_compact_offset(full_text, compact_hit)
         end = _map_compact_offset(full_text, compact_hit + len(compact_needle))
-        return _wrap_position(segments, full_text, start, end)
+        return _wrap_position(segments, full_text, start, end, method="normalized")
 
     return None
 
@@ -209,7 +212,9 @@ def _map_compact_offset(full_text: str, compact_index: int) -> int:
     return len(full_text)
 
 
-def _wrap_position(segments: list[dict], full_text: str, start: int, end: int) -> dict:
+def _wrap_position(
+    segments: list[dict], full_text: str, start: int, end: int, *, method: str = "exact"
+) -> dict:
     matched_index: int | None = None
     for segment in segments:
         if segment["char_start"] <= start < segment["char_end"]:
@@ -226,6 +231,7 @@ def _wrap_position(segments: list[dict], full_text: str, start: int, end: int) -
         "segment_index": matched_index,
         "char_start": start,
         "char_end": end,
+        "method": method,
         "page_no": next(
             (
                 segment["page_no"]

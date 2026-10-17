@@ -261,7 +261,15 @@ def test_provider_reports_effective_thinking_depth():
     assert build_provider(settings).reasoning_effort == "low"
 
     # default = 不下发该参数（部分供应商不认识这个字段会整调用 400），但快照仍记为 default
-    configured = Settings(llm_api_key="sk-test", llm_provider="openai_compatible")
+    configured = Settings(
+        llm_api_key="sk-test",
+        llm_provider="openai_compatible",
+        # 复核端点与密钥显式给全：仓库默认已切到跨供应商复核，
+        # 不给 JUDGE_API_KEY 会走"没有独立密钥就不复核"的闭合分支，测不到深度快照
+        judge_base_url="",
+        judge_api_key="sk-test",
+        judge_same_model_policy="warn",
+    )
     assert build_provider(configured).reasoning_effort == "default"
     judge = build_judge_provider(configured)
     assert judge is not None and judge.reasoning_effort == "default"

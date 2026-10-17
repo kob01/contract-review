@@ -77,19 +77,22 @@ class Settings(BaseSettings):
     llm_max_concurrency: int = Field(default=3, ge=1, le=16)
 
     # ---------- 结论复核（LLM judge）----------
-    #: 与主审查模型分槽：当前两者都是 glm-5.3-flash，日后改 DeepSeek 只改本段几行
-    #: 主模型与复核模型来路不同才能互为独立信号，同一家同一个模型的结论文书要标明这一点
+    #: 复核槽位与主审分属两个供应商：主审 GLM-5.3-Flash，复核 DeepSeek。
+    #: 同一家同一个模型给自己盖章只是附和（回音壁），不构成独立信号，
+    #: 而复核裁定决定结论进不进人工队列，它必须是第二个独立来源
     judge_enabled: bool = True
-    #: 主审与复核同模型时的处置口径（回音壁防护）：
+    #: 主审与复核同来路时的处置口径（回音壁防护）：
     #:   warn       = 照旧调用，但在日志与 /health 里明确报告“复核不是独立信号”
     #:   rule_check = 不叫复核模型，退回确定性规则复核（引用核验 + 双通道一致性裁定）
     #:   fail_fast  = 启动时报错，强制要求两个槽位来路不同（上线前用这个口径检查配置）
-    #: 默认 warn：现有部署明知同源但仍需要一个模型在回路里，降级口径先把开关准备好
-    judge_same_model_policy: Literal["warn", "rule_check", "fail_fast"] = "warn"
-    #: 留空则复用 LLM_BASE_URL / LLM_API_KEY
-    judge_base_url: str = ""
+    #: 默认 fail_fast：复核槽位已指向独立供应商，配回同来路属配置事故，该在启动时就炸
+    judge_same_model_policy: Literal["warn", "rule_check", "fail_fast"] = "fail_fast"
+    #: 留空则复用 LLM_BASE_URL / LLM_API_KEY；指向别家时必须自带 JUDGE_API_KEY
+    judge_base_url: str = "https://api.deepseek.com/v1"
     judge_api_key: str = ""
-    judge_model: str = "glm-5.3-flash"
+    #: DeepSeek 官方现行模型名：`deepseek-flash`（V4.1 Flash，2026-08-21 上线）。
+    #: 旧别名 deepseek-chat / deepseek-reasoner 已于 2026-07-24 退役，别再往这里写
+    judge_model: str = "deepseek-flash"
     judge_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     #: 思考档位上调到开启后必须同步抬预算，否则复现主审通道踩过的坑：
     #: 推理 token 撞满 max_tokens，正文为空（httpx 拿到的是 200 + 空 content）
@@ -163,6 +166,14 @@ class Settings(BaseSettings):
     rag_rerank_timeout_seconds: float = Field(default=30.0, gt=0.0, le=600.0)
     #: 低于该分的候选直接剔除；阈值需按实测分数分布定，不能拍脑袋
     rag_rerank_min_score: float = Field(default=0.30, ge=0.0, le=1.0)
+
+    # ---------- 评测埋点 ----------
+    #: 是否把逐次模型调用与检索过程写进 `review_llm_calls` / `review_retrieval_events`。
+    #: 关掉只该发生在压测场景：没有这两张表，Recall@k、精排误杀率、token 成本全部无数据源
+    eval_telemetry_enabled: bool = True
+    #: 是否保存模型原始响应正文。占空间但可复现幻觉与重解析实验；
+    #: 含个人信息的生产库里建议改 false，只保留结构化结论
+    eval_store_raw_output: bool = True
 
     # ---------- 提示词组装 ----------
     #: 进提示词的条文上限，再多就会挤占条款原文预算并稀释注意力
@@ -289,7 +300,20 @@ class Settings(BaseSettings):
                 "QUEUE_MAX_JOBS 远大于 LLM_MAX_CONCURRENCY：多份审查同时挤供应商限速，"
                 "表现为成批 ReadTimeout，而不是“吞吐提升”"
             )
+        # 复核槽位指向另一家供应商却没给那家的密钥：不能让它把主审密钥发过去然后成批 401。
+        # 这里不 raise —— 复核缺席只是少一道安全网，反过来把整个服务拦在门外是更大的伤害；
+        # 缺席由 `describe_judge_backend` 走"不执行复核"的闭合路径，并在 audit_warnings 里点名
         return self
+
+    @property
+    def judge_endpoint_is_foreign(self) -> bool:
+        """复核是否指向与主审不同的端点（跨供应商复核）。"""
+        return bool(self.judge_base_url) and self.judge_base_url != self.llm_base_url
+
+    @property
+    def judge_missing_own_key(self) -> bool:
+        """跨供应商复核但没有那家的密钥：此时绝不能拿主审密钥去撞别家端点。"""
+        return self.judge_endpoint_is_foreign and not self.judge_api_key
 
     @property
     def is_prod(self) -> bool:
@@ -324,6 +348,11 @@ class Settings(BaseSettings):
             warnings.append("当前为哈希 mock 向量，引用相似度不可信，不得用于对外出报告")
         if not self.llm_api_key:
             warnings.append("未配置 LLM_API_KEY，主审链路走 Mock，结论仅用于流程验证")
+        if self.judge_missing_own_key:
+            warnings.append(
+                f"复核槽位指向 {self.judge_base_url}（{self.judge_model}）但未配置 JUDGE_API_KEY，"
+                "本次不执行结论复核：所有结论按『未复核』处理并照常走置信度路由"
+            )
         if self.judge_shares_main_slot:
             warnings.append(
                 f"复核模型与主审同为 {self.judge_model}，不是独立信号"
